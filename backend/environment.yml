@@ -1,0 +1,27 @@
+# KnowAgent 后端 Conda 环境（环境隔离：专用环境 knowAgent，Python 3.11）
+#
+# 创建/更新：
+#   conda env create -f environment.yml        # 首次创建
+#   conda env update -f environment.yml --prune  # 依赖变更后同步
+# 激活：
+#   conda activate knowAgent
+#
+# 说明：conda 源中已覆盖的包放 conda 段，其余（FastAPI 生态）走 pip 段；
+#       两侧版本需与 requirements.txt 保持一致。
+
+name: knowAgent
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # ---------- conda 段 ----------
+  - python=3.11
+  - pip>=23.3
+  # ---------- pip 段（conda 源缺失或版本滞后的包） ----------
+  - pip:
+      - fastapi>=0.115.0
+      - uvicorn[standard]>=0.30.0
+      - pydantic>=2.7.0
+      - pydantic-settings>=2.3.0
+      - python-dotenv>=1.0.0
+      - httpx>=0.27.0
