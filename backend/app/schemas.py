@@ -66,3 +66,51 @@ class HealthResponse(BaseModel):
     env: str = Field(..., description="运行环境")
     # 大模型是否配置了可用 Key，便于排查「能访问但答不了」的问题
     llm_ready: bool = Field(..., description="DeepSeek 是否已配置可用 API Key")
+
+
+# =====================================================================
+# 会话与历史（P2-B1 / P2-F1 契约）
+# 字段命名对齐前端 src/types.ts 的 Conversation / ConversationMessage，
+# 便于前端直接反序列化。时间统一以 ISO 8601 字符串返回。
+# =====================================================================
+
+class ConversationCreate(BaseModel):
+    """POST /conversations 的请求体：新建会话时可选携带标题。
+
+    不传 title 时由后端在首条用户消息到达时自动回填（见 conversation_service.append_turn）。
+    """
+
+    title: Optional[str] = Field(default=None, description="会话标题（可选，留空则首条问题自动生成）")
+
+
+class ConversationOut(BaseModel):
+    """单个会话的对外视图（列表项与详情共用基础字段）。"""
+
+    id: str = Field(..., description="会话唯一 ID（后端 UUID）")
+    title: Optional[str] = Field(default=None, description="会话标题（首条问题自动生成）")
+    model: str = Field(..., description="对话使用的模型（DeepSeek-Flash）")
+    created_at: str = Field(..., description="创建时间（ISO 8601）")
+    updated_at: str = Field(..., description="更新时间（ISO 8601，最近活跃排序用）")
+
+
+class ConversationSummary(ConversationOut):
+    """会话列表项：在基础字段上附加消息条数，便于前端展示预览。"""
+
+    message_count: int = Field(..., description="该会话下的消息条数")
+
+
+class ConversationMessageOut(BaseModel):
+    """历史消息项：对应 messages 表的一行。"""
+
+    id: str = Field(..., description="消息唯一 ID")
+    role: str = Field(..., description="角色：user / assistant / system")
+    content: str = Field(..., description="消息正文")
+    created_at: str = Field(..., description="发送时间（ISO 8601）")
+
+
+class ConversationDetail(ConversationOut):
+    """会话详情：基础字段 + 按时间正序的历史消息列表。"""
+
+    messages: List[ConversationMessageOut] = Field(
+        default_factory=list, description="历史消息（created_at 正序）"
+    )

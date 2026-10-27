@@ -39,3 +39,14 @@ class LLMNotConfiguredError(DeepSeekError):
 
     def __init__(self, message: str = "大模型 API Key 未配置"):
         super().__init__(message, status_code=None)
+
+
+class ConversationNotFound(Exception):
+    """会话不存在、已被软删除、或不属于当前用户。
+
+    统一用「找不到」语义，避免区分「不存在」与「不属于你」而泄露信息。
+    上层（api/conversations.py）据此返回 404。
+    """
+
+    def __init__(self, conversation_id):
+        super().__init__(f"会话不存在或无权访问：{conversation_id}")

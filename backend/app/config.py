@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     # 说明：P1 仍为进程内内存（重启即丢失、多副本不共享）；
     #      P2（P2-DB1 / P2-A1）会落 PostgreSQL 的 messages 表做持久化。
     MEMORY_MAX_SESSIONS: int = 1000
+    # 注入 LangChain 的历史令牌预算（P2-DB1 上下文窗口管理）：
+    # 从对话持久化消息中加载历史时，最多携带约该数量的估算 token，超出则从最旧开始丢弃，
+    # 防止超长对话把整段历史塞进 prompt 导致 token 溢出 / 成本飙升。
+    CONTEXT_TOKEN_BUDGET: int = 4000
 
     # ---------- 对象存储与文件上传（P1-B2：文档上传落盘） ----------
     # 存储后端类型：local（本地目录，开发免 MinIO）/ minio（MinIO / S3 兼容）。

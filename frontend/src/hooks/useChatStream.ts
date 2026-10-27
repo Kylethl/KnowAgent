@@ -5,12 +5,34 @@ import { startChatStream } from '../services/chatStream';
 // P1-F2：对话流式状态钩子
 // 职责：管理消息列表、流式状态、错误；把 SSE 收到的分片放进「打字机队列」，
 //      再按固定节奏逐字渲染到助手消息上，实现打字机效果。
+//
+// P2-F1 增强：
+//   - 支持 conversationId：发送时把当前会话 ID 带上，使后端按会话持久化与注入历史；
+//   - 支持 onConversationCreated：后端在「首次发送自动建会话」时回传新会话 ID，
+//     钩子通过回调通知父组件绑定到左侧列表；
+//   - 支持 loadMessages / reset：切换会话时把后端返回的历史直接装载进视图（续聊保持上下文），
+//     或清空消息开新会话。
 
 // 打字机参数：每个节拍渲染的字符数与节拍间隔（毫秒）
 const CHARS_PER_TICK = 2;
 const TICK_MS = 24;
 
-export function useChatStream() {
+export interface UseChatStreamOptions {
+  // 当前会话 ID；为 null 时后端自动新建会话（首次发送）。切换会话时父组件更新此值。
+  conversationId: string | null;
+  // 后端回传新会话 ID 时回调（首次自动建会话场景），父组件据此更新 conversationId。
+  onConversationCreated?: (id: string) => void;
+}
+
+export function useChatStream(options: UseChatStreamOptions) {
+  // 把最新的 options 存入 ref，避免闭包过期；同时避免 useCallback 因 options 变化频繁重建。
+  const conversationIdRef = useRef<string | null>(options.conversationId);
+  const onConversationCreatedRef = useRef<((id: string) => void) | undefined>(
+    options.onConversationCreated
+  );
+  conversationIdRef.current = options.conversationId;
+  onConversationCreatedRef.current = options.onConversationCreated;
+
   // 消息列表：当前会话的全部消息
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   // 流式状态：空闲 / 思考中(等首包) / 流式输出中 / 错误
@@ -130,8 +152,8 @@ export function useChatStream() {
       setStreamingId(assistantMsg.id);
       startTyping(assistantMsg.id);
 
-      // 建立 SSE 连接
-      closeRef.current = startChatStream(content, null, {
+      // 建立 SSE 连接：携带当前会话 ID（为 null 时后端自动建会话并回绑）
+      closeRef.current = startChatStream(content, conversationIdRef.current, {
         // 收到分片：入队等待打字机渲染
         onToken: (token) => enqueue(token),
         // 正常结束：标记结束，队列排空后打字机自动收尾
@@ -149,9 +171,33 @@ export function useChatStream() {
           setStreamingId(null);
           closeRef.current = null;
         },
+        // P2-F1：后端回传新建会话 ID，通知父组件绑定到左侧列表
+        onConversation: (id) => {
+          onConversationCreatedRef.current?.(id);
+        },
       });
     },
     [status, enqueue, startTyping, stopTyping]
+  );
+
+  /**
+   * 装载历史消息（P2-F1：切换会话续聊时由父组件调用）。
+   * 直接把后端返回的历史消息替换当前视图，并复位流式状态（历史无需打字机动画）。
+   */
+  const loadMessages = useCallback(
+    (msgs: ChatMessage[]) => {
+      // 若正在流式，先中断，避免历史与进行中的流互相干扰
+      closeRef.current?.();
+      closeRef.current = null;
+      doneRef.current = true;
+      stopTyping();
+      queueRef.current = '';
+      setStreamingId(null);
+      setStatus('idle');
+      setError(null);
+      setMessages(msgs);
+    },
+    [stopTyping]
   );
 
   // 组件卸载时清理 SSE 与定时器，防止泄漏
@@ -162,5 +208,5 @@ export function useChatStream() {
     };
   }, [stopTyping]);
 
-  return { messages, status, error, streamingId, sendMessage, stop };
+  return { messages, status, error, streamingId, sendMessage, stop, loadMessages };
 }

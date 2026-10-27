@@ -76,21 +76,27 @@ async def stream_answer(
     conversation_id: Optional[str] = None,
     history: Optional[List[HistoryItem]] = None,
     meta: Optional[dict] = None,
+    memory_enabled: bool = True,
 ) -> AsyncIterator[str]:
     """流式调用 DeepSeek 逐片段产出回答，并维护该会话的多轮记忆。
 
     流程：
       1. 校验 Key 是否可用（不可用则快速失败，避免发起必然 401 的请求）；
-      2. 若客户端显式传了 history，且服务端尚无该会话记忆，则先注入一次；
+      2. 解析历史来源：
+         - memory_enabled=True（P1 默认 / 无会话持久化）：走 LangChain 内存记忆
+           （读取 / 必要时注入客户端历史 / 写回本轮），保证「单会话多轮上下文」；
+         - memory_enabled=False（P2 会话持久化）：历史由外部（数据库）注入，
+           本函数不再读写内存记忆，避免「内存 + 数据库」双写导致上下文错乱；
       3. 读出会话历史，与 system / question 一起喂给 LangChain 链；
       4. 流式产出增量文本；同时把 finish_reason 写入 meta 供上层判断是否被截断；
-      5. 正常结束后把本轮「用户提问 + 助手回答」写回会话记忆，供下一轮引用。
+      5. memory_enabled=True 时，正常结束后把本轮「用户提问 + 助手回答」写回记忆。
 
     Args:
         question: 用户本轮提问。
-        conversation_id: 会话 ID；为空则使用默认会话。
-        history: 客户端显式携带的历史；None 表示完全依赖服务端记忆。
+        conversation_id: 会话 ID；为空则使用默认会话（仅 memory_enabled=True 时生效）。
+        history: 显式携带的历史（客户端注入或数据库加载）；memory_enabled=False 时作为唯一历史来源。
         meta: 可选的可变字典，用于回传元信息（当前写入 finish_reason）。
+        memory_enabled: 是否启用 LangChain 内存记忆。P2 会话落库后应置 False，由数据库管理历史。
 
     Yields:
         模型增量输出的文本片段。
@@ -107,16 +113,26 @@ async def stream_answer(
             "DeepSeek API Key 未配置，请在 backend/.env 中填写 DEEPSEEK_API_KEY"
         )
 
-    store = get_memory_store()
-    session_history = store.get_session_history(conversation_id)
-    session_id = session_history.conversation_id
+    # 2) 解析历史来源：内存记忆路径 vs 外部注入路径
+    if memory_enabled:
+        # P1 默认路径：会话上下文由 LangChain 内存记忆托管
+        store = get_memory_store()
+        session_history = store.get_session_history(conversation_id)
+        session_id = session_history.conversation_id
 
-    # 2) 客户端历史注入（仅在会话为空时生效，避免每轮重复叠加）
-    if history:
-        await store.seed_history(session_id, history)
+        # 客户端历史注入（仅在会话为空时生效，避免每轮重复叠加）
+        if history:
+            await store.seed_history(session_id, history)
 
-    # 3) 组装本轮输入：历史取自该会话的记忆对象（已在上一步注入/裁剪）
-    history_messages: List[BaseMessage] = await session_history.aget_messages()
+        # 历史取自该会话的内存记忆对象（已在上一步注入/裁剪）
+        history_messages: List[BaseMessage] = await session_history.aget_messages()
+    else:
+        # P2 持久化路径：历史由数据库加载并作为参数传入，本函数不再触碰内存记忆，
+        # 避免「内存 + 数据库」双写导致下一轮注入重复/错乱的历史。
+        session_id = conversation_id or "db"
+        history_messages = dicts_to_messages(history) if history else []
+
+    # 3) 组装本轮输入：历史 + system + 本轮提问
     inputs: Dict[str, Any] = {
         "system_prompt": cfg.SYSTEM_PROMPT,
         "history": history_messages,
@@ -124,9 +140,10 @@ async def stream_answer(
     }
 
     logger.info(
-        "开始流式回答（LangChain 链）：conversation_id=%s，历史消息数=%d",
+        "开始流式回答（LangChain 链）：conversation_id=%s，历史消息数=%d，memory_enabled=%s",
         session_id,
         len(history_messages),
+        memory_enabled,
     )
 
     chain = get_chat_chain()
@@ -148,10 +165,10 @@ async def stream_answer(
         # 因此「客户端中断」不会走到这里，也就不会把半截回答写入记忆。
         raise wrap_llm_error(exc) from exc
 
-    # 5) 正常收尾：写回本轮对话，使下一轮能引用本轮内容
+    # 5) 正常收尾：memory_enabled=True 时写回本轮对话，使下一轮能引用本轮内容
     full_answer = "".join(answer_parts)
-    if full_answer:
-        session_history.add_messages(
+    if memory_enabled and full_answer:
+        session_history.add_messages(  # type: ignore[name-defined]  # 仅 memory_enabled=True 分支存在
             [HumanMessage(content=question), AIMessage(content=full_answer)]
         )
     logger.info("流式回答结束：conversation_id=%s，共生成 %d 个字符", session_id, len(full_answer))

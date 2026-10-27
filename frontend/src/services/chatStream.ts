@@ -17,12 +17,15 @@ export interface ChatStreamHandlers {
   onToken: (token: string) => void; // 收到一个文本分片
   onDone: () => void; // 流正常结束（收到 [DONE] 或服务端关闭）
   onError: (err: Error) => void; // 流异常中断
+  // P2-F1：服务端在流起始下发 {type:"conversation",id} 帧，
+  //       用于「首次发送自动建会话」时把新会话 ID 回绑给前端（绑定左侧列表）。
+  onConversation?: (id: string) => void;
 }
 
 /**
  * 启动一次 SSE 对话流
  * @param message 用户输入的提问内容
- * @param conversationId 会话 ID（P2 接入历史后启用；当前单会话传 null）
+ * @param conversationId 会话 ID（P2 启用；不传则后端自动新建会话并回绑 ID）
  * @param handlers 流事件回调
  * @returns 关闭函数，调用即中断流（用于「停止生成」）
  */
@@ -52,6 +55,14 @@ export function startChatStream(
       return;
     }
 
+    // P2-F1：会话回绑帧 —— {"type":"conversation","id":"..."}
+    // 仅解析一次（同一流里 id 不变），交由上层把新会话绑定到左侧列表。
+    const bound = tryParseConversation(raw);
+    if (bound) {
+      handlers.onConversation?.(bound);
+      return;
+    }
+
     // 兼容两种数据格式：JSON（{"content":"..."}）与纯文本分片
     const text = extractContent(raw);
     if (text) {
@@ -67,6 +78,24 @@ export function startChatStream(
 
   // 返回中断函数
   return () => es.close();
+}
+
+/**
+ * 尝试从 SSE data 帧中解析会话回绑信息。
+ * 形如 {"type":"conversation","id":"uuid"} 时返回 id，否则返回 null。
+ * 解析失败（非 JSON / 非该类型）一律返回 null，避免影响正文分片处理。
+ */
+function tryParseConversation(raw: string): string | null {
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw) as { type?: unknown; id?: unknown };
+    if (parsed.type === 'conversation' && typeof parsed.id === 'string') {
+      return parsed.id;
+    }
+  } catch {
+    // 非该类型帧，交由 extractContent 处理
+  }
+  return null;
 }
 
 /**

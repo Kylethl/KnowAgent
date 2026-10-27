@@ -1,27 +1,41 @@
-# /chat 流式对话接口（P1-B1 骨架 / P1-A1 接入 LangChain 链路）
-# 职责：接收用户提问 → 交给 LangChain 调用链（含多轮记忆）→ 以 SSE 逐片回传前端。
+# /chat 流式对话接口（P1-B1 骨架 / P1-A1 接入 LangChain 链路 / P2 接入会话持久化）
+# 职责：接收用户提问 → 交给 LangChain 调用链（含多轮历史）→ 以 SSE 逐片回传前端。
 #
 # 提供两个入口（对应《开发任务清单》P1-B1 的「GET/POST /chat」）：
 #   - GET  /chat?message=...&conversation_id=...
 #       供前端 EventSource 使用。EventSource 原生只支持 GET 且不能带请求体，
 #       所以提问内容走 query 参数（见 frontend/src/services/chatStream.ts）。
 #   - POST /chat  JSON: {"message": "...", "conversation_id": "...", "history": [...]}
-#       为长文本提问与 P2 会话历史预留；前端后续改用 fetch + ReadableStream 消费时切换。
+#       为长文本提问与后续阶段（P2 会话历史）预留；前端后续改用 fetch + ReadableStream 消费时切换。
 #
 # 两者共用同一套流式逻辑，返回均为 text/event-stream：
 #   data: {"content":"片段"}\n\n  × N   →   data: [DONE]\n\n
+#
+# P2 增强（本次迭代）：
+#   - 会话持久化：conversation_id 存在时按 user_id 隔离读取/写入 conversations / messages 表；
+#     不存在时自动新建会话；首条消息自动回填标题。
+#   - 历史注入：注入前从数据库加载「上下文窗口」内的历史（见 conversation_service.load_history_window），
+#     由数据库作为历史唯一来源（memory_enabled=False，避免与内存记忆双写）。
+#   - 会话回绑：流起始下发一帧 data: {"type":"conversation","id":"..."}，便于前端在「首次发送自动建会话」
+#     时拿到会话 ID 并绑定到左侧列表。
+#   - 容错：若数据库不可用（如本地开发未起 PG），自动回退到 P1 内存记忆路径，保证「无 DB 也能对话」。
 
 import asyncio
 from typing import AsyncIterator, List, Optional
+from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Header, Query
 from fastapi.responses import StreamingResponse
 from starlette.responses import Response
 
+from ..config import get_settings
 from ..core.errors import DeepSeekError
 from ..core.logging import get_logger
-from ..core.sse import sse_comment, sse_content, sse_done, sse_headers
+from ..core.security import resolve_user_id
+from ..core.sse import sse_comment, sse_content, sse_done, sse_headers, sse_json
+from ..db.engine import SessionLocal
 from ..schemas import ChatMessage, ChatRequest
+from ..services import conversation_service as svc
 from ..services.chat_chain import stream_answer
 
 logger = get_logger(__name__)
@@ -44,18 +58,30 @@ async def chat_get(
     conversation_id: Optional[str] = Query(
         default=None, description="会话 ID，用于多轮上下文；不传则使用默认会话"
     ),
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ) -> Response:
     """SSE 流式对话（GET 入口，供 EventSource 消费）。"""
-    return _stream_response(message=message, conversation_id=conversation_id, history=None)
+    return _stream_response(
+        message=message, conversation_id=conversation_id, history=None, x_user_id=x_user_id
+    )
 
 
 @router.post("/chat", response_class=StreamingResponse)
-async def chat_post(payload: ChatRequest) -> Response:
-    """SSE 流式对话（POST 入口，支持长文本与显式历史）。"""
+async def chat_post(
+    payload: ChatRequest,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+) -> Response:
+    """SSE 流式对话（POST 入口，支持长文本与显式历史）。
+
+    说明（P2）：当 conversation_id 有效且数据库可用时，以数据库历史为唯一来源，
+    忽略 payload.history（避免客户端历史与数据库历史重复叠加）；仅当数据库不可用回退
+    内存记忆时，才会使用 payload.history。
+    """
     return _stream_response(
         message=payload.message,
         conversation_id=payload.conversation_id,
         history=payload.history,
+        x_user_id=x_user_id,
     )
 
 
@@ -63,19 +89,23 @@ def _stream_response(
     message: str,
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
+    x_user_id: Optional[str] = None,
 ) -> StreamingResponse:
     """构造 SSE 流式响应。
 
     Args:
         message: 用户本轮提问。
-        conversation_id: 会话 ID（可为空，落到默认会话）。
-        history: 客户端显式传入的历史；为 None 时使用后端会话记忆。
+        conversation_id: 会话 ID（可为空，落到默认会话或新建）。
+        history: 客户端显式传入的历史；数据库可用时忽略，回退内存路径时使用。
+        x_user_id: 请求头 X-User-Id（P2-B2 真实鉴权下发；当前为占位，缺失走 Demo 用户）。
 
     Returns:
         StreamingResponse：media_type 为 text/event-stream，逐帧推送回答片段。
     """
     return StreamingResponse(
-        _event_generator(message=message, conversation_id=conversation_id, history=history),
+        _event_generator(
+            message=message, conversation_id=conversation_id, history=history, x_user_id=x_user_id
+        ),
         media_type="text/event-stream",
         # 关闭 nginx 缓冲 + 禁用缓存，保证真正的「边生成边下发」
         headers=sse_headers(),
@@ -86,59 +116,125 @@ async def _event_generator(
     message: str,
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
+    x_user_id: Optional[str] = None,
 ) -> AsyncIterator[str]:
-    """SSE 事件生成器：流式产出回答片段。
+    """SSE 事件生成器：流式产出回答片段，并按 P2 约定做会话持久化与历史注入。
 
     流程：
-      1. 先发一帧注释（心跳），立刻冲刷响应头，避免客户端/代理等待；
-      2. 把请求交给 LangChain 调用链——多轮历史的读取/注入/写回由链路内部完成
-         （见 services/chat_chain.py 与 services/langchain_memory.py）；
-      3. 逐片转发模型增量；异常时把可读错误写进助手气泡，保证流能正常收尾。
+      1. 心跳帧：立刻冲刷响应头；
+      2. 解析当前用户（占位：X-User-Id 或 Demo 用户）；
+      3. 尝试数据库持久化路径：
+         - 新建/读取会话（user_id 隔离、归属校验）；
+         - 下发 {"type":"conversation","id":...} 回绑帧；
+         - 从数据库加载上下文窗口内历史，注入 LangChain（memory_enabled=False）；
+         - 流式生成；结束（且有完整回答）后落库本轮对话；
+      4. 若数据库不可用，回退到 P1 内存记忆路径（不持久化），保证开发期无 DB 也能对话；
+      5. 统一的截断提示与结束哨兵。
     """
     # 1) 心跳帧：让前端尽快收到首字节（配合 X-Accel-Buffering: no 生效）
     yield sse_comment("connected")
 
-    # 2) 客户端显式传入的历史优先（POST /chat）；GET 场景为 None，完全依赖服务端记忆
-    client_history = [{"role": m.role, "content": m.content} for m in history] if history else None
+    # 2) 解析当前用户（P2-B2 前为占位 Demo 用户）
+    user_id = resolve_user_id(x_user_id)
 
-    logger.info(
-        "收到 /chat 请求：conversation_id=%s，客户端历史=%s",
-        conversation_id or "default",
-        len(client_history) if client_history else 0,
-    )
+    # 把客户端传入的 conversation_id 解析为 UUID；非法/缺失都视为「需要新建/默认」
+    conv_uuid: Optional[UUID] = None
+    if conversation_id:
+        try:
+            conv_uuid = UUID(conversation_id)
+        except (ValueError, AttributeError):
+            conv_uuid = None
 
-    # 3) 逐片转发 LangChain 链路的输出
-    # meta 用于回传上游 finish_reason，便于判断回答是否被 max_tokens 截断
+    cfg = get_settings()
+
+    # 3) 尝试数据库持久化路径（P2 主路径）
     meta: dict = {}
-    answer_parts: List[str] = []
+    try:
+        async with SessionLocal() as db:
+            # 新建或读取会话（user_id 隔离 + 归属校验）
+            conv = await svc.get_or_create_conversation(db, user_id, conv_uuid)
+            # 回绑帧：前端在「首次发送自动建会话」时据此拿到会话 ID
+            yield sse_json({"type": "conversation", "id": str(conv.id)})
+
+            # 从数据库加载上下文窗口内的历史（P2-DB1：防 token 溢出）
+            db_history = await svc.load_history_window(
+                db, conv.id, cfg.MEMORY_MAX_TURNS, cfg.CONTEXT_TOKEN_BUDGET
+            )
+
+            # 流式生成：历史来自 DB，关闭内存记忆（memory_enabled=False），避免双写
+            answer_parts: List[str] = []
+            try:
+                async for chunk in stream_answer(
+                    message,
+                    conversation_id=str(conv.id),
+                    history=db_history,
+                    meta=meta,
+                    memory_enabled=False,
+                ):
+                    answer_parts.append(chunk)
+                    yield sse_content(chunk)
+            except DeepSeekError as exc:
+                # 上游异常：把可读错误下发给前端展示（前端会渲染在助手气泡里）
+                logger.error("DeepSeek 调用失败：%s", exc)
+                yield sse_content(f"\n\n[回答失败] {exc}")
+            except asyncio.CancelledError:
+                # 客户端中断：记录后继续向上抛出，由 Starlette 关闭连接；不落库半截回答
+                logger.info("流式回答被客户端中断：conversation_id=%s", conv.id)
+                raise
+            except Exception as exc:  # noqa: BLE001 ——兜底，保证流一定能正常收尾
+                logger.exception("流式回答出现未预期错误")
+                yield sse_content(f"\n\n[回答失败] 服务内部错误：{exc}")
+
+            # 正常收尾：有完整回答才落库（避免把空回答/报错写入历史）
+            full_answer = "".join(answer_parts)
+            if full_answer:
+                try:
+                    await svc.append_turn(db, conv.id, message, full_answer)
+                except Exception as exc:  # noqa: BLE001 ——落库失败仅记录，不影响已下发的流
+                    logger.error("落库本轮对话失败：%s", exc)
+
+            # 若因达到 max_tokens 上限被截断，明确提示用户
+            if meta.get("finish_reason") == "length":
+                logger.warning(
+                    "回答因达到 max_tokens 上限被截断：conversation_id=%s，已生成 %d 字符",
+                    conv.id,
+                    len(full_answer),
+                )
+                yield sse_content(
+                    "\n\n⚠️ 回答因达到长度上限（DEEPSEEK_MAX_TOKENS）被截断，后续内容已省略。"
+                    "可在 backend/.env 调大 DEEPSEEK_MAX_TOKENS 后重试。"
+                )
+
+            # 结束哨兵：前端收到后关闭 EventSource
+            yield sse_done()
+            return
+
+    except Exception as db_exc:  # noqa: BLE001 ——DB 不可用：回退内存记忆，保证开发期可用
+        logger.warning("会话持久化路径不可用，回退到内存记忆（不落库）：%s", db_exc)
+
+    # 4) 回退：P1 内存记忆路径（不持久化）——与 P1 行为一致，便于无 DB 环境联调
+    meta = {}
+    answer_parts = []
     try:
         async for chunk in stream_answer(
             message,
             conversation_id=conversation_id,
-            history=client_history,
+            history=[{"role": m.role, "content": m.content} for m in history] if history else None,
             meta=meta,
         ):
             answer_parts.append(chunk)
             yield sse_content(chunk)
     except DeepSeekError as exc:
-        # 上游异常：把可读错误下发给前端展示（前端会渲染在助手气泡里），
-        # 而不是直接断开连接——否则前端只能显示「连接中断」。
         logger.error("DeepSeek 调用失败：%s", exc)
         yield sse_content(f"\n\n[回答失败] {exc}")
     except asyncio.CancelledError:
-        # 客户端中断（点了「停止生成」或关闭页面）：记录后继续向上抛出，
-        # 由 Starlette 负责关闭连接；此处不写入记忆，避免半截回答污染上下文。
         logger.info("流式回答被客户端中断：conversation_id=%s", conversation_id)
         raise
     except Exception as exc:  # noqa: BLE001 ——兜底，保证流一定能正常收尾
         logger.exception("流式回答出现未预期错误")
         yield sse_content(f"\n\n[回答失败] 服务内部错误：{exc}")
 
-    # 4) 日志记录本轮规模（不再由此处写记忆：LangChain 链路在生成成功后已自行写回）
     full_answer = "".join(answer_parts)
-    logger.info("流式回答结束：共 %d 个字符", len(full_answer))
-
-    # 4.1) 若因达到 max_tokens 上限被截断，明确提示用户（否则无法区分「答完」与「被截断」）
     if meta.get("finish_reason") == "length":
         logger.warning(
             "回答因达到 max_tokens 上限被截断：conversation_id=%s，已生成 %d 字符",

@@ -1,0 +1,65 @@
+# 知识库问答网站 — 本地开发编排（仅依赖：PostgreSQL + 可选 Adminer）
+# ---------------------------------------------------------------------
+# 用途：本地日常开发时，前后端用 macOS 原生方式跑（享受热重载），
+#       只把「有状态依赖」PostgreSQL 交给 Docker 起，避免每次重建应用镜像。
+#
+# 与 docker-compose.yml（完整三件套：nginx + backend + postgres）的区别：
+#   - 本文件不含 backend / frontend 镜像，不构建、不打包，本地迭代最快。
+#   - 数据库凭证、卷名、端口与正式 compose 完全一致，
+#     因此 backend/.env 里的 DATABASE_URL（localhost:5432/knowagent）可直接复用。
+#
+# 用法（在本文件所在目录 docker/ 执行）：
+#   docker compose -f docker-compose.dev.yml up -d        # 后台启动 Postgres（+ Adminer）
+#   docker compose -f docker-compose.dev.yml ps           # 查看容器状态
+#   docker compose -f docker-compose.dev.yml logs -f postgres  # 跟踪数据库日志
+#   docker compose -f docker-compose.dev.yml down         # 停止并移除容器（保留数据卷）
+#   docker compose -f docker-compose.dev.yml down -v      # 同时删除数据卷（清空数据库）
+#
+# 启动后：
+#   - 后端连 http://localhost:5432/knowagent（用户 knowagent / 密码 knowagent）
+#   - 建表：cd ../backend && python -m app.db.init_db
+#   - 看库（若启用 adminer）：浏览器打开 http://localhost:8080
+#                         系统=PostgreSQL，服务器=postgres，用户名/密码/库=knowagent
+#
+# 说明：本文件与正式 compose 默认同属 docker 项目，数据卷名均为 docker_pgdata，
+#       因此二者之间切换不会丢失已建库表；但二者不要同时运行（均占用 5432 端口）。
+
+services:
+  # ---------- 数据库（唯一必需服务） ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # 与 backend DATABASE_URL 保持一致（postgres 镜像会据此自动建库建用户）
+      POSTGRES_USER: knowagent
+      POSTGRES_PASSWORD: knowagent
+      POSTGRES_DB: knowagent
+    volumes:
+      # 命名卷持久化数据；与正式 compose 共用 docker_pgdata，切换不丢数据
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 映射到宿主机，便于后端（原生 uvicorn）与 psql 直连
+      - "5432:5432"
+    healthcheck:
+      # pg_isready 随 postgres 镜像自带；就绪后才允许 adminer 启动
+      test: ["CMD-SHELL", "pg_isready -U knowagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------- 数据库可视化管理（可选，开发看库用） ----------
+  # 说明：仅本地调试方便查看表/数据；不需要可整体删除本 service。
+  adminer:
+    image: adminer:4
+    # 默认连接目标指向同 compose 网络的 postgres 服务名
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      # 浏览器访问 http://localhost:8080
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  # 与主 compose 同名的命名卷，保证数据在两种编排间共享
+  pgdata:

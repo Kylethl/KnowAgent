@@ -69,3 +69,35 @@ export interface UploadItem {
   error?: string; // 失败原因（status=error 时有值）
   record?: DocumentRecord; // 成功后服务端返回的文档记录
 }
+
+// =====================================================================
+// P2-F1：对话历史与删除相关类型
+// 契约来源：《需求清单》P2 功能1「对话历史与删除」+ 后端 app/api/conversations.py
+//   - 前端：左侧会话列表（新建/选中/删除）+ 切换会话续聊保持上下文
+//   - 数据存储：conversations / messages 表，按 user_id 隔离（P2-DB1）
+// 字段命名与后端 Conversation* 响应模型严格对齐（id / title / model /
+// created_at / updated_at / message_count / messages），避免多次映射出错。
+// =====================================================================
+
+// 会话列表项：基础字段 + 消息条数
+export interface ConversationSummary {
+  id: string; // 会话唯一 ID（后端 UUID）
+  title: string | null; // 会话标题（首条问题自动生成，可能为空）
+  model: string; // 对话使用的模型（DeepSeek-Flash）
+  created_at: string; // 创建时间（ISO 8601）
+  updated_at: string; // 更新时间（ISO 8601，最近活跃排序用）
+  message_count: number; // 该会话下的消息条数
+}
+
+// 会话详情：基础字段 + 历史消息列表
+export interface ConversationDetail extends ConversationSummary {
+  messages: ConversationMessage[]; // 历史消息（按时间正序）
+}
+
+// 单条历史消息：对应 messages 表的一行
+export interface ConversationMessage {
+  id: string; // 消息唯一 ID
+  role: MessageRole; // 角色：user / assistant / system
+  content: string; // 消息正文
+  created_at: string; // 发送时间（ISO 8601）
+}
