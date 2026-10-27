@@ -25,3 +25,14 @@ dependencies:
       - pydantic-settings>=2.3.0
       - python-dotenv>=1.0.0
       - httpx>=0.27.0
+      # 表单 / 文件上传解析（/documents/upload 必需）
+      - python-multipart>=0.0.9
+      # LangChain 生态（P1-A1）：封装 DeepSeek 调用链 + 会话记忆
+      - langchain>=1.0,<2
+      - langchain-core>=1.0,<2
+      - langchain-deepseek>=1.0,<2
+      # 数据库（P1-DB1 起）：PostgreSQL 异步 ORM
+      - sqlalchemy>=2.0,<3
+      - asyncpg>=0.29.0
+      # 对象存储（P1-B2）：MinIO / S3 兼容 SDK（minio 后端使用，懒导入）
+      - minio>=7.2.0

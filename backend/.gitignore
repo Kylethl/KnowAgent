@@ -17,3 +17,6 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# 本地上传文件落盘目录（STORAGE_BACKEND=local 时生成；应走 Docker 挂载卷，不入库）
+data/

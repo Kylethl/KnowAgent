@@ -1,39 +1,49 @@
-# P1-B1 接口冒烟测试：验证 /chat 的 SSE 契约
+# P1-A1 /chat 接口冒烟测试：验证 SSE 契约与 LangChain 链路的对接
 #
 # 原则（见《测试任务清单》）：AI 相关调用一律用 mock 隔离，不产生费用、不依赖网络。
 # 运行：conda activate knowAgent && pytest tests -q
+#
+# 说明：多轮记忆的正确性在 test_chat_chain.py 中验证（那里能拿到链路内部的消息组装结果），
+#       本文件只关注「接口层契约」：流式帧格式、参数校验、异常降级。
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.api.chat as chat_module
 from app.main import create_app
-from app.services.memory import get_memory
 
 
 @pytest.fixture()
 def client():
-    """创建测试用应用实例（每次用例独立，避免会话记忆互相污染）。"""
-    # 清空进程内记忆单例的缓存，保证用例之间互不干扰
-    get_memory.cache_clear()
+    """创建测试用应用实例（每次用例独立，避免状态互相污染）。"""
     return TestClient(create_app())
 
 
 @pytest.fixture()
 def fake_stream(monkeypatch):
-    """替换真实的 DeepSeek 调用：按固定分片产出文本，并记录收到的入参。
+    """替换真实的 LangChain 调用链：按固定分片产出文本，并记录收到的入参。
 
     Returns:
-        captured: 列表，收集每次调用时传给模型的 messages，用于断言历史注入。
+        captured: 列表，收集每次调用的关键入参，用于断言路由与历史透传。
     """
     captured = []
 
-    async def _fake(messages, settings=None):
-        captured.append(messages)
+    async def _fake(message, conversation_id=None, history=None, meta=None):
+        captured.append(
+            {
+                "message": message,
+                "conversation_id": conversation_id,
+                "history": history,
+                "meta": meta,
+            }
+        )
+        # 模拟 finish_reason 回传：验证元信息能否顺着链路透出给上层
+        if isinstance(meta, dict):
+            meta["finish_reason"] = "stop"
         for piece in ["你好", "，我是", "知识库助手"]:
             yield piece
 
-    monkeypatch.setattr(chat_module, "stream_chat", _fake)
+    monkeypatch.setattr(chat_module, "stream_answer", _fake)
     return captured
 
 
@@ -70,23 +80,37 @@ def test_chat_post_streams_tokens(client, fake_stream):
         frames = [line for line in resp.iter_lines() if line]
 
     assert frames[-1] == "data: [DONE]"
-    # 提问被正确传入模型入参的最后一轮
-    assert fake_stream[0][-1]["content"] == "讲讲知识库"
+    # 提问被正确透传给调用链
+    assert fake_stream[0]["message"] == "讲讲知识库"
 
 
-def test_chat_injects_history_on_second_turn(client, fake_stream):
-    """第二轮提问应携带第一轮的历史，实现单会话多轮记忆。"""
-    with client.stream("GET", "/chat", params={"message": "我叫小明"}) as resp:
+def test_chat_passes_conversation_id_to_chain(client, fake_stream):
+    """会话 ID 应原样透传给调用链，用于多轮记忆寻址。"""
+    with client.stream(
+        "GET", "/chat", params={"message": "你好", "conversation_id": "conv-1"}
+    ) as resp:
         list(resp.iter_lines())
-    with client.stream("GET", "/chat", params={"message": "我叫什么"}) as resp:
+
+    assert fake_stream[0]["conversation_id"] == "conv-1"
+
+
+def test_chat_forwards_client_history(client, fake_stream):
+    """POST /chat 携带的显式历史应传给调用链做历史注入。"""
+    payload = {
+        "message": "那第二点呢",
+        "conversation_id": "conv-2",
+        "history": [
+            {"role": "user", "content": "介绍下知识库"},
+            {"role": "assistant", "content": "它是……"},
+        ],
+    }
+    with client.stream("POST", "/chat", json=payload) as resp:
         list(resp.iter_lines())
 
-    second_turn_messages = fake_stream[1]
-    roles = [m["role"] for m in second_turn_messages]
-    # system + 上一轮(user/assistant) + 本轮 user
-    assert roles[0] == "system"
-    assert "user" in roles and "assistant" in roles
-    assert second_turn_messages[-1]["content"] == "我叫什么"
+    assert fake_stream[0]["history"] == [
+        {"role": "user", "content": "介绍下知识库"},
+        {"role": "assistant", "content": "它是……"},
+    ]
 
 
 def test_chat_rejects_empty_message(client, fake_stream):
@@ -96,18 +120,37 @@ def test_chat_rejects_empty_message(client, fake_stream):
     assert fake_stream == []
 
 
-def test_chat_without_api_key_reports_error(client, monkeypatch):
-    """未配置 Key 时不应抛异常中断连接，而应在流内给出可读提示并正常收尾。"""
-    from app.services import deepseek_client
+def test_chat_reports_error_in_stream(client, monkeypatch):
+    """链路报错时不应中断连接，而应在流内给出可读提示并正常收尾。"""
+    from app.core.errors import LLMNotConfiguredError
 
-    async def _raise(messages, settings=None):
-        raise deepseek_client.DeepSeekError("DeepSeek API Key 未配置")
+    async def _raise(message, conversation_id=None, history=None, meta=None):
+        raise LLMNotConfiguredError("DeepSeek API Key 未配置")
         yield  # pragma: no cover —— 仅为让函数成为生成器
 
-    monkeypatch.setattr(chat_module, "stream_chat", _raise)
+    monkeypatch.setattr(chat_module, "stream_answer", _raise)
 
     with client.stream("GET", "/chat", params={"message": "你好"}) as resp:
         frames = [line for line in resp.iter_lines() if line]
 
     assert frames[-1] == "data: [DONE]"
     assert any("未配置" in f for f in frames)
+
+
+def test_chat_warns_when_truncated(client, monkeypatch):
+    """回答被 max_tokens 截断时，应追加可读的截断提示（否则用户无法分辨「答完」与「截断」）。"""
+
+    async def _truncated(message, conversation_id=None, history=None, meta=None):
+        if isinstance(meta, dict):
+            meta["finish_reason"] = "length"
+        yield "半截回答"
+
+    monkeypatch.setattr(chat_module, "stream_answer", _truncated)
+
+    with client.stream("GET", "/chat", params={"message": "写一篇长文"}) as resp:
+        frames = [line for line in resp.iter_lines() if line]
+
+    body = "\n".join(frames)
+    assert "半截回答" in body
+    assert "被截断" in body
+    assert frames[-1] == "data: [DONE]"

@@ -1,0 +1,21 @@
+# 后端构建上下文忽略项（避免把无关文件打进镜像）
+# 绝不打包本地环境变量（含真实 Key）
+.env
+.env.example
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 运行期生成的上传文件（应走挂载卷，不进镜像）
+data/
+
+# 测试代码（运行镜像不需要）
+tests/
+
+# git 与编辑器
+.git/
+.idea/
+.vscode/

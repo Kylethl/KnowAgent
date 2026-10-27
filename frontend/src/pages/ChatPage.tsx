@@ -1,7 +1,9 @@
+import { useState } from 'react';
 import { Alert } from 'antd';
 import TopBar from '../components/TopBar';
 import MessageList from '../components/MessageList';
 import ChatInput from '../components/ChatInput';
+import UploadPanel from '../components/UploadPanel';
 import { useChatStream } from '../hooks/useChatStream';
 
 // 对话页面：组合「顶部标题栏 / 中央消息区 / 底部输入框」三块，
@@ -10,10 +12,14 @@ import { useChatStream } from '../hooks/useChatStream';
 // P1-F1：完成四区骨架（标题栏 / 消息区 / 气泡 / 输入框）。
 // P1-F2：接入 useChatStream —— 用 EventSource 消费 /chat 流，
 //        实现打字机逐字渲染、加载/停顿态（思考中、停止按钮）与错误提示。
+// P1-F3：顶部新增「上传文档」入口，点击展开右侧上传抽屉（拖拽上传 + 进度 + 待审核标签）。
 export default function ChatPage() {
   // P1-F2：接入流式钩子，获取消息列表、流式状态、错误与发送/停止方法
   const { messages, status, error, streamingId, sendMessage, stop } =
     useChatStream();
+
+  // P1-F3：上传抽屉的展开状态（由顶部按钮开启，抽屉内关闭）
+  const [uploadOpen, setUploadOpen] = useState(false);
 
   return (
     // 最外层：纵向 flex 占满视口，浅灰背景
@@ -25,7 +31,8 @@ export default function ChatPage() {
         background: '#f7f8fa',
       }}
     >
-      <TopBar />
+      {/* P1-F3：顶部栏传入「上传文档」回调，点击即展开抽屉 */}
+      <TopBar onUploadClick={() => setUploadOpen(true)} />
       {/* 中间区域：横向居中，限制内容最大宽度，呈现豆包式窄栏对话 */}
       <div
         style={{
@@ -59,6 +66,9 @@ export default function ChatPage() {
           <ChatInput onSend={sendMessage} onStop={stop} status={status} />
         </div>
       </div>
+
+      {/* P1-F3：文档上传抽屉，独立于对话区，关闭不影响正在进行的对话流 */}
+      <UploadPanel open={uploadOpen} onClose={() => setUploadOpen(false)} />
     </div>
   );
 }

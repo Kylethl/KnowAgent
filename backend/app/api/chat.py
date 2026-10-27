@@ -1,5 +1,5 @@
-# /chat 流式对话接口（P1-B1）
-# 职责：接收用户提问 → 组装多轮上下文 → 调 DeepSeek → 以 SSE 逐片回传前端。
+# /chat 流式对话接口（P1-B1 骨架 / P1-A1 接入 LangChain 链路）
+# 职责：接收用户提问 → 交给 LangChain 调用链（含多轮记忆）→ 以 SSE 逐片回传前端。
 #
 # 提供两个入口（对应《开发任务清单》P1-B1 的「GET/POST /chat」）：
 #   - GET  /chat?message=...&conversation_id=...
@@ -18,12 +18,11 @@ from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 from starlette.responses import Response
 
-from ..config import Settings, get_settings
+from ..core.errors import DeepSeekError
 from ..core.logging import get_logger
 from ..core.sse import sse_comment, sse_content, sse_done, sse_headers
 from ..schemas import ChatMessage, ChatRequest
-from ..services.deepseek_client import DeepSeekError, build_chat_messages, stream_chat
-from ..services.memory import get_memory
+from ..services.chat_chain import stream_answer
 
 logger = get_logger(__name__)
 
@@ -88,43 +87,37 @@ async def _event_generator(
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
 ) -> AsyncIterator[str]:
-    """SSE 事件生成器：流式产出回答片段，并在结束后写入会话记忆。
+    """SSE 事件生成器：流式产出回答片段。
 
     流程：
       1. 先发一帧注释（心跳），立刻冲刷响应头，避免客户端/代理等待；
-      2. 确定上下文：客户端显式 history 优先，否则读后端会话记忆；
-      3. 记录本轮用户提问，组装 DeepSeek 消息数组；
-      4. 逐片转发模型增量；
-      5. 正常结束后把完整回答写回记忆，最后下发 [DONE]。
+      2. 把请求交给 LangChain 调用链——多轮历史的读取/注入/写回由链路内部完成
+         （见 services/chat_chain.py 与 services/langchain_memory.py）；
+      3. 逐片转发模型增量；异常时把可读错误写进助手气泡，保证流能正常收尾。
     """
-    settings: Settings = get_settings()
-    memory = get_memory()
-
     # 1) 心跳帧：让前端尽快收到首字节（配合 X-Accel-Buffering: no 生效）
     yield sse_comment("connected")
 
-    # 2) 组装历史上下文：客户端显式传入优先，否则取后端记忆（P2 起改为读库）
-    if history is not None:
-        history_items = [{"role": m.role, "content": m.content} for m in history]
-    else:
-        history_items = await memory.history(conversation_id)
-
-    # 3) 先把用户提问落记忆，再组装模型入参（保证助手回答时上下文含本轮提问）
-    await memory.append(conversation_id, "user", message)
-    messages = build_chat_messages(settings.SYSTEM_PROMPT, history_items, message)
+    # 2) 客户端显式传入的历史优先（POST /chat）；GET 场景为 None，完全依赖服务端记忆
+    client_history = [{"role": m.role, "content": m.content} for m in history] if history else None
 
     logger.info(
-        "开始流式回答：conversation_id=%s，历史消息数=%d",
+        "收到 /chat 请求：conversation_id=%s，客户端历史=%s",
         conversation_id or "default",
-        len(history_items),
+        len(client_history) if client_history else 0,
     )
 
-    # 4) 逐片转发模型输出
+    # 3) 逐片转发 LangChain 链路的输出
     # meta 用于回传上游 finish_reason，便于判断回答是否被 max_tokens 截断
     meta: dict = {}
     answer_parts: List[str] = []
     try:
-        async for chunk in stream_chat(messages, settings, meta=meta):
+        async for chunk in stream_answer(
+            message,
+            conversation_id=conversation_id,
+            history=client_history,
+            meta=meta,
+        ):
             answer_parts.append(chunk)
             yield sse_content(chunk)
     except DeepSeekError as exc:
@@ -141,13 +134,11 @@ async def _event_generator(
         logger.exception("流式回答出现未预期错误")
         yield sse_content(f"\n\n[回答失败] 服务内部错误：{exc}")
 
-    # 5) 正常收尾：把完整回答写入记忆，使下一轮问答能引用本轮内容
+    # 4) 日志记录本轮规模（不再由此处写记忆：LangChain 链路在生成成功后已自行写回）
     full_answer = "".join(answer_parts)
-    if full_answer:
-        await memory.append(conversation_id, "assistant", full_answer)
     logger.info("流式回答结束：共 %d 个字符", len(full_answer))
 
-    # 5.1) 若因达到 max_tokens 上限被截断，明确提示用户（否则无法区分「答完」与「被截断」）
+    # 4.1) 若因达到 max_tokens 上限被截断，明确提示用户（否则无法区分「答完」与「被截断」）
     if meta.get("finish_reason") == "length":
         logger.warning(
             "回答因达到 max_tokens 上限被截断：conversation_id=%s，已生成 %d 字符",

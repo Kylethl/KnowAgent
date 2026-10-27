@@ -1,0 +1,82 @@
+# 知识库问答网站 — P1 本地编排（P1-Dep1 Docker Compose）
+# 拓扑：nginx(80) 托管前端静态 + 反代 /api → backend(8000) ↔ postgres(5432)
+# 与《需求清单》第四节一致：P1 仅需 nginx + backend + PostgreSQL 三件套。
+#
+# 用法（在本文件所在目录执行）：
+#   docker compose up --build          # 构建并前台启动（日志同屏）
+#   docker compose up -d --build       # 后台启动
+#   docker compose ps                  # 查看容器状态
+#   docker compose down                # 停止并移除容器（保留数据卷）
+#   docker compose down -v             # 同时删除数据卷（清空数据库与上传文件）
+#   docker compose logs -f backend     # 跟踪后端日志
+#
+# 环境变量：本目录 .env（可选，见 .env.example）注入 DEEPSEEK_API_KEY。
+#   docker compose 会自动读取同目录 .env 作为变量源，供 ${...} 占位符替换。
+
+services:
+  # ---------- 数据库 ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      # 与 backend DATABASE_URL 保持一致（postgres 镜像会据此自动建库建用户）
+      POSTGRES_USER: knowagent
+      POSTGRES_PASSWORD: knowagent
+      POSTGRES_DB: knowagent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 仅本地调试用（便于 psql 直连）；生产可删除此映射
+      - "5432:5432"
+    healthcheck:
+      # pg_isready 随 postgres 镜像自带；就绪后才允许 backend 启动
+      test: ["CMD-SHELL", "pg_isready -U knowagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ---------- 后端 FastAPI ----------
+  backend:
+    build: ../backend
+    environment:
+      # 容器内环境：关闭热重载（RELOAD=false），保留开发文档便于联调
+      APP_ENV: development
+      RELOAD: "false"
+      # 数据库连接：host 指向 compose 服务名 postgres（非 localhost）
+      DATABASE_URL: postgresql+asyncpg://knowagent:knowagent@postgres:5432/knowagent
+      # 文档上传：本地存储后端 + 挂载卷（对象存储 MinIO 在 P3 引入）
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_DIR: /app/data/uploads
+      # CORS：浏览器同源经 nginx 访问；兜底放通 localhost
+      CORS_ORIGINS: http://localhost
+      DEEPSEEK_MODEL: deepseek-flash
+      LOG_LEVEL: INFO
+      # DeepSeek Key：由宿主机 .env 注入（见 .env.example）；
+      # 缺省为空 → 服务可起但 /chat 返回「未配置」提示，不影响上传与页面。
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+    volumes:
+      - uploads:/app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # 便于直接调试后端；生产可删除，仅经 nginx 访问
+      - "8000:8000"
+    healthcheck:
+      # 用镜像内 Python 探活 /health（slim 镜像无 curl/wget）
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------- 前端（nginx 托管 + 反代） ----------
+  nginx:
+    build: ../frontend
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    # 前端静态资源已烤进镜像（多阶段构建），无需挂卷
+
+volumes:
+  pgdata:
+  uploads:

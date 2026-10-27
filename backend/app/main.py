@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api import chat
+from .api import documents as documents_router
 from .config import get_settings
 from .core.logging import get_logger, setup_logging
 from .schemas import HealthResponse
@@ -78,6 +79,8 @@ def create_app() -> FastAPI:
     # ---------- 路由 ----------
     # P1-B1：/chat（GET 供 EventSource，POST 供后续长文本/历史场景）
     app.include_router(chat.router)
+    # P1-B2：/documents/upload（文档上传：格式/大小校验 + 对象存储 + 落库元数据）
+    app.include_router(documents_router.router)
 
     @app.get("/health", response_model=HealthResponse, tags=["ops"], summary="健康检查")
     async def health() -> HealthResponse:

@@ -9,6 +9,33 @@ from pydantic import BaseModel, Field
 Role = Literal["system", "user", "assistant"]
 
 
+# =====================================================================
+# 文档上传（P1-B2 / P1-F3 契约）
+# 字段命名严格对齐前端 src/types.ts 的 DocumentRecord，便于前端直接反序列化。
+# =====================================================================
+
+class DocumentUploadResponse(BaseModel):
+    """POST /documents/upload 的成功响应。
+
+    字段与前端 DocumentRecord 一一对应：
+      id / filename / type / status / size / storage_path / created_at
+    其中后端库内字段 original_path → storage_path，size_bytes → size。
+    """
+
+    id: str = Field(..., description="文档唯一 ID（后端 UUID）")
+    filename: str = Field(..., description="原始文件名（展示用）")
+    # 文档类型：word（.doc/.docx）/ markdown（.md）
+    type: str = Field(..., description="文档类型：word / markdown")
+    # 生命周期状态：P1 上传成功固定为 pending（待审核）
+    status: str = Field(..., description="文档状态：pending / indexed / rejected")
+    # 文件字节数（对应库内 size_bytes）
+    size: int = Field(..., description="文件大小（字节）")
+    # 对象存储相对路径（不含 bucket），仅展示用，禁止前端拼接成下载链接
+    storage_path: str = Field(..., description="对象存储相对路径（展示用）")
+    # 提交时间（ISO 8601）
+    created_at: str = Field(..., description="提交时间（ISO 8601 字符串）")
+
+
 class ChatMessage(BaseModel):
     """一条对话消息（用于历史上下文注入）。"""
 

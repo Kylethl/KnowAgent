@@ -4,5 +4,8 @@
 # 单元测试运行器（《测试任务清单》后端测试主力）
 pytest>=8.0.0
 
+# 异步测试支持：pytest 默认不执行 async def 用例，需由该插件接管
+pytest-asyncio>=0.23.0
+
 # HTTP Mock：隔离 DeepSeek / 外部 API 调用，避免真实请求产生费用
 respx>=0.21.0
