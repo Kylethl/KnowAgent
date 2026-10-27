@@ -4,7 +4,7 @@
 #       的差异，满足《云存储测试方案》中「存储可替换、本地 MinIO 与云上行为一致」的原则。
 #
 # 设计要点：
-#   1. 统一接口 BaseStorage：put_object / delete_object（异步方法）。
+#   1. 统一接口 BaseStorage：put_object / get_object / delete_object（异步方法）。
 #   2. 两种实现：
 #      - LocalStorage：写到本地目录，开发期零依赖即可跑通上传闭环（免 MinIO）。
 #      - MinioStorage：使用官方 minio SDK（同步），经 asyncio.to_thread 异步化；
@@ -60,6 +60,21 @@ class BaseStorage(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def get_object(self, key: str) -> bytes:
+        """读取一个对象（P3-B1 管理员预览文档内容用）。
+
+        Args:
+            key: 相对对象键（不含 bucket）。
+
+        Returns:
+            对象二进制内容。
+
+        Raises:
+            StorageError: 对象不存在或读取失败（由具体实现决定，通常转 404/502）。
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     async def delete_object(self, key: str) -> None:
         """删除一个对象（补偿删除用）。
 
@@ -101,6 +116,27 @@ class LocalStorage(BaseStorage):
         except OSError as exc:  # 磁盘满 / 权限不足等
             raise StorageError(f"本地文件写入失败：{exc}") from exc
         logger.debug("LocalStorage 写入成功：%s（%d 字节）", target, len(data))
+
+    async def get_object(self, key: str) -> bytes:
+        """读取本地落盘的对象内容（管理员预览用）。
+
+        路径穿越防护：解析后校验目标仍在 root 之内，避免 key 含 ../ 读到系统文件。
+        """
+        target = (self.root / key).resolve()
+        root = self.root.resolve()
+        # 校验解析后的绝对路径仍在根目录内（含根目录自身）
+        if not (target == root or root in target.parents):
+            raise StorageError(f"非法的对象键：{key}", status_code=400)
+
+        def _read() -> bytes:
+            return target.read_bytes()
+
+        try:
+            return await asyncio.to_thread(_read)
+        except FileNotFoundError as exc:
+            raise StorageError(f"对象不存在：{key}", status_code=404) from exc
+        except OSError as exc:
+            raise StorageError(f"本地文件读取失败：{exc}") from exc
 
     async def delete_object(self, key: str) -> None:
         target = self.root / key
@@ -182,6 +218,23 @@ class MinioStorage(BaseStorage):
             raise StorageError(f"MinIO 对象写入失败：{exc}") from exc
         logger.debug("MinioStorage 写入成功：bucket=%s，key=%s（%d 字节）", self.bucket, key, len(data))
 
+    async def get_object(self, key: str) -> bytes:
+        def _get() -> bytes:
+            from io import BytesIO
+
+            # get_object 返回的是可关闭的流，这里一次性读进内存（文档最大 20MB，可接受）
+            resp = self._client.get_object(self.bucket, key)
+            try:
+                return BytesIO(resp.read()).getvalue()
+            finally:
+                resp.close()
+                resp.release_conn()
+
+        try:
+            return await asyncio.to_thread(_get)
+        except Exception as exc:  # 对象不存在 / 网络抖动 / 凭证失效等
+            raise StorageError(f"MinIO 对象读取失败：{exc}") from exc
+
     async def delete_object(self, key: str) -> None:
         def _delete() -> None:
             # remove_object 对不存在的对象会抛错，这里吞掉以保证补偿可重试
@@ -207,7 +260,11 @@ def build_object_key(scope: str | None, ext: str) -> str:
         ext: 文件扩展名（**不含点**，如 "docx" / "md"）。
     """
     now = datetime.now()
-    safe_scope = (scope or "anonymous").strip() or "anonymous"
+    # 兼容 UUID 入参：调用方（services/documents.py）传的是 _parse_user_id() 的结果，
+    # 其类型为 Optional[UUID]。P1 无鉴权时该值为 None（走 anonymous）；
+    # P2-B2 鉴权后必为 UUID，直接 .strip() 会抛 AttributeError，故此处统一转字符串。
+    safe_scope = str(scope).strip() if scope else "anonymous"
+    safe_scope = safe_scope or "anonymous"
     # 去掉 scope 中可能混入的路径分隔符，防止目录穿越
     safe_scope = safe_scope.replace("/", "_").replace("\\", "_")
     return f"{safe_scope}/{now.year:04d}/{now.month:02d}/{uuid4().hex}.{ext}"

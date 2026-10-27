@@ -41,7 +41,18 @@ sqlalchemy>=2.0,<3
 # PostgreSQL 异步驱动（SQLAlchemy 异步引擎依赖）
 asyncpg>=0.29.0
 
+# ---------- 用户鉴权（P2-B2：JWT + 密码加密） ----------
+# JWT 签发与校验（HS256）；用于 /auth 登录令牌与各业务接口的鉴权依赖
+PyJWT>=2.8,<3
+# 密码哈希：bcrypt（《需求清单》P2-B2 明确要求），绝不存明文密码
+bcrypt>=4.0.1
+
 # ---------- 对象存储（P1-B2：文档原始文件落盘） ----------
 # MinIO / S3 兼容 SDK：STORAGE_BACKEND=minio 时用于读写对象。
 # 采用懒导入（见 services/storage.py），本地开发仅用 local 后端时不强制安装。
 minio>=7.2.0
+
+# ---------- 文档解析（P3-B1 预览 / P3-A1 入库解析） ----------
+# 读取 .docx 文本：P3-B1 管理员在线预览用；P3-A1 入库切片复用同一套解析。
+# 采用懒导入（见 services/review_service.py），未安装时 Word 预览降级为提示文案。
+python-docx>=1.1.0

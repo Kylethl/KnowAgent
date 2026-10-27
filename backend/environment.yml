@@ -34,5 +34,10 @@ dependencies:
       # 数据库（P1-DB1 起）：PostgreSQL 异步 ORM
       - sqlalchemy>=2.0,<3
       - asyncpg>=0.29.0
+      # 用户鉴权（P2-B2）：JWT 令牌签发校验 + bcrypt 密码哈希
+      - PyJWT>=2.8,<3
+      - bcrypt>=4.0.1
       # 对象存储（P1-B2）：MinIO / S3 兼容 SDK（minio 后端使用，懒导入）
       - minio>=7.2.0
+      # 文档解析（P3-B1 管理员预览 / P3-A1 入库切片）：读取 .docx 文本
+      - python-docx>=1.1.0

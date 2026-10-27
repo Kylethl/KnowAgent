@@ -76,6 +76,23 @@ class Settings(BaseSettings):
     # 是否打印 SQL（调试用，生产务必关闭）
     DB_ECHO: bool = False
 
+    # ---------- 用户鉴权（P2-B2：JWT + bcrypt） ----------
+    # JWT 签名密钥（HS256）。⚠️ 必须使用足够长（≥32 字节）的随机值，
+    # 切勿提交到代码仓库；生产环境务必通过环境变量注入。
+    # 生成方式：python -c "import secrets;print(secrets.token_urlsafe(48))"
+    JWT_SECRET_KEY: str = "CHANGE_ME_INSECURE_DEV_SECRET"
+    # JWT 签名算法：对称密钥场景固定 HS256（PyJWT 支持）
+    JWT_ALGORITHM: str = "HS256"
+    # 访问令牌有效期（分钟）：默认 1 天（60*24）。
+    # 说明：令牌不持久化、无刷新令牌，过期后重新登录即可（P2 阶段足够）。
+    JWT_EXPIRE_MINUTES: int = 60 * 24
+    # 是否强制所有业务接口要求鉴权（P2-Dep1「所有接口要求鉴权」）。
+    # 说明：置 False 时接口回退到「Demo 用户」模式，仅供本地无库联调；
+    #       生产/联调务必保持 True。
+    AUTH_REQUIRED: bool = True
+    # 密码哈希强度：bcrypt cost factor。12 为安全与性能的常用折中。
+    BCRYPT_ROUNDS: int = 12
+
     # ---------- 会话记忆（P1-A1：LangChain 记忆） ----------
     # 单会话保留的历史轮次（1 轮 = 1 条用户消息 + 1 条助手消息）。
     # 超出后由 services/langchain_memory.py 按窗口裁剪，防止上下文膨胀导致 token 溢出。
@@ -113,6 +130,50 @@ class Settings(BaseSettings):
     # P5 再扩展 image/audio/video。
     ALLOWED_EXTENSIONS: str = "docx,doc,md"
 
+    # ---------- 知识库向量与入库（P3 功能2：RAG 管线） ----------
+    # 千问 Embedding 服务的 API Key（阿里云百炼 / DashScope）。
+    # ⚠️ 开发期可留空：留空或形如 sk-REPLACE_ME 时，embedding 走**确定性 mock 向量**，
+    #    仅用于跑通「解析 → 切片 → 写向量」管线，向量相似度无语义，不可用于真实检索。
+    #    接入真实检索（P4）前必须填入真实 Key。
+    QWEN_API_KEY: str = ""
+    # Embedding 服务地址：qwen3-vl-embedding 走 DashScope 多模态向量接口
+    QWEN_EMBEDDING_BASE_URL: str = (
+        "https://dashscope.aliyuncs.com/api/v1/services/embeddings/"
+        "multimodal-embedding/multimodal-embedding"
+    )
+    # 向量模型：按《需求清单》锁定为 qwen3-vl-embedding（文本/图文多模态，P5 复用）
+    QWEN_EMBEDDING_MODEL: str = "qwen3-vl-embedding"
+    # 向量维度：qwen3-vl-embedding 支持 2560/2048/1536/1024/768/512/256，默认 2560。
+    # 本项目取 1024 权衡存储与召回；⚠️ 必须与 sql/004 的 vector(N) 与 ORM 的 EMBEDDING_DIM 一致，
+    # 变更需 DROP 重建 document_chunks 表。
+    EMBEDDING_DIM: int = 1024
+    # 单批送入 embedding 的文本条数：qwen3-vl-embedding 单次请求的 contents 元素上限为 20，
+    # 取较小值以控制单次请求体积与失败重试成本。
+    EMBEDDING_BATCH_SIZE: int = 6
+    # 单次 embedding 请求的超时（秒）与失败重试次数
+    EMBEDDING_TIMEOUT: float = 30.0
+    EMBEDDING_MAX_RETRIES: int = 2
+    # Embedding 接口协议模式：auto / openai / dashscope
+    #   - auto（默认）：根据 BASE_URL 自动判断——
+    #       BASE_URL 含 "compatible-mode" 或以 "/v1" 结尾 → OpenAI 兼容协议（POST {base}/embeddings）；
+    #       否则视为 DashScope 原生多模态向量接口（BASE_URL 已是完整 endpoint）。
+    #   - openai：强制 OpenAI 兼容 embeddings 协议（阿里云百炼 compatible-mode 网关、本地 vLLM 等）。
+    #   - dashscope：强制 DashScope 多模态向量接口（qwen3-vl-embedding 原生路径）。
+    # 本项目本地开发配的是百炼 compatible-mode 网关，auto 即可正确识别为 openai 模式。
+    QWEN_EMBEDDING_API_MODE: str = "auto"
+    # 切片策略（P3-A1）：目标切片字符数与相邻切片重叠字符数。
+    # 800/120 对中文文档是常用取值：既保证单切片语义完整，又避免跨切片丢失上下文。
+    CHUNK_SIZE: int = 800
+    CHUNK_OVERLAP: int = 120
+
+    # ---------- 异步任务（P3-B2：Celery + Redis） ----------
+    # Celery 的消息队列与结果后端（P3-Dep1 引入 Redis）。
+    CELERY_BROKER_URL: str = "redis://localhost:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
+    # 是否使用 Celery 执行入库任务。置 False 或未装 celery / Redis 不可达时，
+    # 后端自动回退为「进程内后台任务」，保证开发期无 Redis 也能跑通入库闭环。
+    USE_CELERY: bool = True
+
     # ---------- 日志 ----------
     LOG_LEVEL: str = "INFO"
 
@@ -129,6 +190,17 @@ class Settings(BaseSettings):
         return bool(key) and not key.startswith("sk-REPLACE_ME")
 
     @property
+    def is_jwt_configured(self) -> bool:
+        """判断 JWT 签名密钥是否已替换为安全随机值（P2-B2 启动自检用）。
+
+        仍在使用内置占位密钥时视为「未配置」：此时任何人都能伪造令牌，
+        必须在启动时给出醒目告警（生产环境应视为严重配置错误）。
+        """
+        secret = (self.JWT_SECRET_KEY or "").strip()
+        # 占位密钥或长度不足 32 字节（HS256 的 RFC 7518 建议下限）均视为不安全
+        return bool(secret) and secret != "CHANGE_ME_INSECURE_DEV_SECRET" and len(secret) >= 32
+
+    @property
     def allowed_extensions_list(self) -> List[str]:
         """把逗号分隔的 ALLOWED_EXTENSIONS 解析为小写扩展名列表（去空）。
 
@@ -140,6 +212,17 @@ class Settings(BaseSettings):
     def max_upload_size_mb(self) -> float:
         """把字节上限换算为 MB，便于日志/错误提示中展示。"""
         return round(self.MAX_UPLOAD_SIZE / (1024 * 1024), 2)
+
+    @property
+    def is_qwen_configured(self) -> bool:
+        """判断千问 Embedding 是否已配置可用 Key（P3 功能2 启动自检用）。
+
+        留空或仍为占位值（sk-REPLACE_ME）时视为未配置：
+        此时 embedding 走 mock 向量，入库管线可跑通但向量不具备语义相似度，
+        启动时会给出醒目告警，避免误以为已具备检索能力（P4 的前提）。
+        """
+        key = (self.QWEN_API_KEY or "").strip()
+        return bool(key) and not key.startswith("sk-REPLACE_ME")
 
 
 @lru_cache(maxsize=1)

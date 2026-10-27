@@ -24,14 +24,14 @@ import asyncio
 from typing import AsyncIterator, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from starlette.responses import Response
 
 from ..config import get_settings
 from ..core.errors import DeepSeekError
 from ..core.logging import get_logger
-from ..core.security import resolve_user_id
+from ..core.security import get_current_user_id_sse
 from ..core.sse import sse_comment, sse_content, sse_done, sse_headers, sse_json
 from ..db.engine import SessionLocal
 from ..schemas import ChatMessage, ChatRequest
@@ -58,18 +58,21 @@ async def chat_get(
     conversation_id: Optional[str] = Query(
         default=None, description="会话 ID，用于多轮上下文；不传则使用默认会话"
     ),
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    # P2-B2 鉴权：由依赖统一解析当前用户（令牌缺失/失效直接 401，不会进入流）。
+    # EventSource 无法自定义请求头，故该依赖内部额外支持 ?token=xxx 传参。
+    user_id: UUID = Depends(get_current_user_id_sse),
 ) -> Response:
     """SSE 流式对话（GET 入口，供 EventSource 消费）。"""
     return _stream_response(
-        message=message, conversation_id=conversation_id, history=None, x_user_id=x_user_id
+        message=message, conversation_id=conversation_id, history=None, user_id=user_id
     )
 
 
 @router.post("/chat", response_class=StreamingResponse)
 async def chat_post(
     payload: ChatRequest,
-    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    # P2-B2 鉴权：POST 走 fetch，优先用 Authorization 头；依赖内部同样兼容 ?token=
+    user_id: UUID = Depends(get_current_user_id_sse),
 ) -> Response:
     """SSE 流式对话（POST 入口，支持长文本与显式历史）。
 
@@ -81,7 +84,7 @@ async def chat_post(
         message=payload.message,
         conversation_id=payload.conversation_id,
         history=payload.history,
-        x_user_id=x_user_id,
+        user_id=user_id,
     )
 
 
@@ -89,7 +92,7 @@ def _stream_response(
     message: str,
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
-    x_user_id: Optional[str] = None,
+    user_id: UUID,
 ) -> StreamingResponse:
     """构造 SSE 流式响应。
 
@@ -97,14 +100,14 @@ def _stream_response(
         message: 用户本轮提问。
         conversation_id: 会话 ID（可为空，落到默认会话或新建）。
         history: 客户端显式传入的历史；数据库可用时忽略，回退内存路径时使用。
-        x_user_id: 请求头 X-User-Id（P2-B2 真实鉴权下发；当前为占位，缺失走 Demo 用户）。
+        user_id: 当前登录用户 UUID（已由鉴权依赖解析，本函数不再做身份判断）。
 
     Returns:
         StreamingResponse：media_type 为 text/event-stream，逐帧推送回答片段。
     """
     return StreamingResponse(
         _event_generator(
-            message=message, conversation_id=conversation_id, history=history, x_user_id=x_user_id
+            message=message, conversation_id=conversation_id, history=history, user_id=user_id
         ),
         media_type="text/event-stream",
         # 关闭 nginx 缓冲 + 禁用缓存，保证真正的「边生成边下发」
@@ -116,13 +119,14 @@ async def _event_generator(
     message: str,
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
-    x_user_id: Optional[str] = None,
+    user_id: UUID,
 ) -> AsyncIterator[str]:
     """SSE 事件生成器：流式产出回答片段，并按 P2 约定做会话持久化与历史注入。
 
     流程：
       1. 心跳帧：立刻冲刷响应头；
-      2. 解析当前用户（占位：X-User-Id 或 Demo 用户）；
+      2. 当前用户 user_id 由路由的鉴权依赖解析后传入（P2-B2：JWT 校验，
+         令牌无效时依赖直接返回 401，不会进入本生成器）；
       3. 尝试数据库持久化路径：
          - 新建/读取会话（user_id 隔离、归属校验）；
          - 下发 {"type":"conversation","id":...} 回绑帧；
@@ -134,8 +138,8 @@ async def _event_generator(
     # 1) 心跳帧：让前端尽快收到首字节（配合 X-Accel-Buffering: no 生效）
     yield sse_comment("connected")
 
-    # 2) 解析当前用户（P2-B2 前为占位 Demo 用户）
-    user_id = resolve_user_id(x_user_id)
+    # 2) 当前用户已由鉴权依赖（get_current_user_id_sse）解析并传入，
+    #    这里不再做身份判断——身份不可信的请求在进入生成器前就已被 401 拦截。
 
     # 把客户端传入的 conversation_id 解析为 UUID；非法/缺失都视为「需要新建/默认」
     conv_uuid: Optional[UUID] = None

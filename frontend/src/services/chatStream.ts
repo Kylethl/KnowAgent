@@ -1,9 +1,15 @@
 import type { ChatMessage } from '../types';
+import { getToken } from './http';
 
 // P1-F2：SSE 流式对话服务
 // 职责：用 EventSource 消费后端 /chat 流，把收到的文本分片回调给上层。
 // 说明：EventSource 原生只支持 GET，因此消息通过查询参数传递，
 //      与后端 P1-B1「GET/POST /chat」中的 GET 分支对应。
+//
+// P2-F2：EventSource **无法自定义请求头**，无法携带 Authorization，
+//      因此令牌只能作为 query 参数 ?token=xxx 传递（后端 get_current_user_id_sse
+//      已兼容：优先取 Authorization 头，缺失时回退 query 的 token）。
+//      该方案的安全权衡详见后端 core/security.py 的注释（依赖 HTTPS + 短时效令牌）。
 
 // 后端约定的流结束哨兵（收到即认为本轮回答结束）
 export const DONE_SIGNAL = '[DONE]';
@@ -39,6 +45,13 @@ export function startChatStream(
   url.searchParams.set('message', message);
   if (conversationId) {
     url.searchParams.set('conversation_id', conversationId);
+  }
+  // P2-F2：附带 JWT。EventSource 不能设置请求头，故令牌走 query 参数。
+  // 后端 GET /chat 的鉴权依赖会读取该参数；无令牌时（未登录）服务端返回 401，
+  // 浏览器对 SSE 的 401 不会走 onerror 的文本解析，此时表现为连接被拒。
+  const token = getToken();
+  if (token) {
+    url.searchParams.set('token', token);
   }
 
   // 建立 SSE 长连接

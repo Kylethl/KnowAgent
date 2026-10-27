@@ -1,4 +1,4 @@
-import { Progress, Tag, Typography } from 'antd';
+import { Progress, Tag, Tooltip, Typography } from 'antd';
 import type { DocStatus, UploadItem } from '../types';
 
 // P1-F3：上传项状态标签
@@ -10,13 +10,44 @@ import type { DocStatus, UploadItem } from '../types';
 // 文档状态 → 标签文案与颜色
 // 取值覆盖后端 documents.status 的全部 5 种（见 sql/002_p1_db2_documents.sql）；
 // P1 阶段只会出现 pending，其余为 P3 审核/入库流程预留，避免届时再改组件。
-const STATUS_META: Record<DocStatus, { label: string; color: string }> = {
+// 导出供「我的文档」等纯状态展示场景复用（见 DocumentStatusBadge）。
+export const STATUS_META: Record<DocStatus, { label: string; color: string }> = {
   pending: { label: '待审核', color: 'gold' },
   approved: { label: '审核通过', color: 'cyan' },
   indexing: { label: '入库中', color: 'blue' },
   indexed: { label: '已入库', color: 'green' },
   rejected: { label: '已驳回', color: 'red' },
 };
+
+/**
+ * 直接展示文档生命周期状态的徽标（不依赖上传队列项）。
+ * 供「我的文档」列表、管理员后台状态列等「纯状态」场景复用。
+ *
+ * 说明：后端入库失败并不会产生独立的 status 值，而是回退为 'approved'
+ *       并写入 last_index_error，因此需结合该字段区分「已通过待入库」与「入库失败」。
+ *
+ * @param status 文档生命周期状态
+ * @param lastIndexError 最近一次入库失败原因（成功为空）；非空即视为「入库失败」
+ */
+export function DocumentStatusBadge({
+  status,
+  lastIndexError,
+}: {
+  status: DocStatus;
+  lastIndexError?: string | null;
+}) {
+  // 入库失败：status 已回退为 approved，用 lastIndexError 非空来判定
+  if ((status === 'approved' || status === 'indexing') && lastIndexError) {
+    return (
+      <Tooltip title={lastIndexError}>
+        <Tag color="red">入库失败</Tag>
+      </Tooltip>
+    );
+  }
+  const meta = STATUS_META[status];
+  return <Tag color={meta.color}>{meta.label}</Tag>;
+}
+
 
 interface Props {
   item: UploadItem; // 上传队列中的一项

@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.chat as chat_module
-from app.core.security import DEMO_USER_ID
+from app.core.security import DEMO_USER_ID, get_current_user_id_sse
 from app.main import create_app
 
 
@@ -56,7 +56,12 @@ class _AsyncSessionCtx:
 
 @pytest.fixture()
 def client():
+    """创建测试应用并覆盖鉴权依赖（P2-B2 后 /chat 要求有效令牌）。
+
+    用依赖覆盖注入固定 Demo 用户，让本文件专注验证「会话持久化链路」。
+    """
     app = create_app()
+    app.dependency_overrides[get_current_user_id_sse] = lambda: DEMO_USER_ID
     return TestClient(app)
 
 
@@ -64,8 +69,8 @@ def _install_db_path(monkeypatch, conv_id: str, history, captured: dict):
     """装配「数据库可用」路径所需的全部桩。"""
     db = AsyncMock()
     monkeypatch.setattr(chat_module, "SessionLocal", lambda: _AsyncSessionCtx(db))
-    # chat.py 直接调用 resolve_user_id 解析当前用户；桩掉它返回固定 Demo 用户
-    monkeypatch.setattr(chat_module, "resolve_user_id", lambda x=None: DEMO_USER_ID)
+    # P2-B2：当前用户已由路由的鉴权依赖（get_current_user_id_sse）解析，
+    #        测试中通过 dependency_overrides 注入固定用户，无需再桩 resolve_user_id。
 
     async def fake_get_or_create(dbsession, user_id, conversation_id=None):
         conv = AsyncMock()

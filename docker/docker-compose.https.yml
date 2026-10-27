@@ -1,0 +1,70 @@
+# 知识库问答网站 — 生产 HTTPS 编排（P2-Dep1：nginx + Let's Encrypt）
+# ---------------------------------------------------------------------
+# 定位：docker-compose.yml 的**覆盖文件**，不单独使用。
+#   docker-compose.yml          ：本地开发（nginx 走 HTTP，无需证书）
+#   docker-compose.https.yml    ：生产上线（nginx 走 HTTPS + certbot 续期）
+#
+# 用法（在 docker/ 目录执行）：
+#   1) 首次签发证书（先确保 80 端口可访问、域名已解析到本机）：
+#      docker compose -f docker-compose.yml -f docker-compose.https.yml run --rm certbot \
+#        certbot certonly --webroot -w /var/www/certbot \
+#        --cert-name knowagent -d your.domain.com \
+#        --email you@example.com --agree-tos --no-eff-email
+#
+#   2) 启动全站（证书就绪后）：
+#      docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+#
+#   3) 证书续期后让 nginx 重新加载（certbot 容器只负责续期，不会自动 reload）：
+#      docker compose -f docker-compose.yml -f docker-compose.https.yml exec nginx nginx -s reload
+#      （可配到宿主机 crontab，每月执行一次即可；Let's Encrypt 证书有效期 90 天）
+#
+# 目录说明（首次使用会自动创建）：
+#   ./certbot/conf  存放证书与私钥（nginx 只读挂载）
+#   ./certbot/www   存放 ACME 校验临时文件（webroot 方式）
+
+services:
+  # ---------- nginx：切换为 HTTPS 配置 ----------
+  nginx:
+    volumes:
+      # 用 HTTPS 配置覆盖镜像内默认的 HTTP 配置（见 frontend/nginx.https.conf）
+      - ../frontend/nginx.https.conf:/etc/nginx/conf.d/default.conf:ro
+      # ACME 校验目录（certbot webroot 写入，nginx 读取）
+      - ./certbot/www:/var/www/certbot:ro
+      # 证书目录（certbot 生成，nginx 只读使用）
+      - ./certbot/conf:/etc/letsencrypt:ro
+    ports:
+      # 80：保留给 ACME 校验 + 301 跳 HTTPS
+      - "80:80"
+      # 443：HTTPS 主入口
+      - "443:443"
+
+  # ---------- certbot：证书签发与自动续期 ----------
+  certbot:
+    image: certbot/certbot
+    container_name: knowagent-certbot
+    volumes:
+      # 与 nginx 共享两个目录：webroot 写校验文件，conf 存证书
+      - ./certbot/www:/var/www/certbot
+      - ./certbot/conf:/etc/letsencrypt
+    # 常驻循环：每 12 小时尝试续期一次（Let's Encrypt 建议频率）；
+    # 证书未到期时 certbot renew 会直接跳过，开销极低。
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done;'"
+
+  # ---------- 后端：生产环境收紧 ----------
+  backend:
+    environment:
+      # 生产关闭交互文档（减少暴露面，与 config.APP_ENV 行为一致）
+      APP_ENV: production
+      # CORS：生产由 nginx 同域托管，来源写真实域名（含 https）
+      # ⚠️ 上线前把 your.domain.com 换成实际域名
+      CORS_ORIGINS: https://your.domain.com
+      # P2-Dep1「所有接口要求鉴权」：生产必须开启（缺省即 true，这里显式声明）
+      AUTH_REQUIRED: "true"
+      # 数据库：仍走 compose 服务名 postgres
+      DATABASE_URL: postgresql+asyncpg://knowagent:knowagent@postgres:5432/knowagent
+      # ⚠️ JWT 密钥必须通过环境变量注入（切勿使用占位值，否则令牌可被伪造）：
+      #     生成：python -c "import secrets;print(secrets.token_urlsafe(48))"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?生产环境必须设置 JWT_SECRET_KEY}
+      # 生产收紧日志级别
+      LOG_LEVEL: WARNING
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?生产环境必须设置 DEEPSEEK_API_KEY}

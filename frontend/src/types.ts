@@ -101,3 +101,137 @@ export interface ConversationMessage {
   content: string; // 消息正文
   created_at: string; // 发送时间（ISO 8601）
 }
+
+// =====================================================================
+// P2-F2：用户鉴权相关类型
+// 契约来源：《需求清单》P2 功能2「用户鉴权与登录」+ 后端 app/api/auth.py
+//   - 前端：登录/注册页、token 存储（localStorage）、路由守卫
+//   - 后端：JWT 鉴权、注册/登录、密码 bcrypt 加密；users 表预留 role
+// 字段与后端 UserOut / TokenResponse 严格对齐（不返回 password_hash 等敏感字段）。
+// =====================================================================
+
+// 用户角色：普通用户 / 管理员
+// 与后端 users.role 的 CHECK 约束一致（user/admin）；admin 供 P3 管理后台 RBAC 使用
+export type AuthRole = 'user' | 'admin';
+
+// 登录用户（脱敏视图）
+export interface AuthUser {
+  id: string; // 用户唯一 ID（后端 UUID）
+  username: string; // 登录名
+  email: string | null; // 邮箱（可为空）
+  role: AuthRole; // 角色
+  created_at: string; // 注册时间（ISO 8601）
+}
+
+// 登录成功响应：令牌 + 有效期 + 用户信息
+export interface LoginResult {
+  access_token: string; // JWT 访问令牌
+  token_type: string; // 固定 bearer
+  expires_in: number; // 有效期（秒）
+  user: AuthUser; // 当前登录用户
+}
+
+// =====================================================================
+// P3-F1：管理员审核相关类型
+// 契约来源：《需求清单》P3 功能1「管理员审核」
+//   - 前端：管理员后台页、待审核列表、文档预览、通过/驳回（驳回必填理由）
+//   - 后端：GET /admin/documents、POST /admin/documents/{id}/review、
+//          GET /admin/documents/{id}/preview（全部 require_admin）
+// 字段与后端 AdminDocumentOut / ReviewResult / DocumentPreviewResponse 严格对齐。
+// =====================================================================
+
+// 审核结论：与后端 documents.review_status 的 CHECK 约束一致（P3-DB1 新增列）
+// pending   待审核
+// approved  审核通过
+// rejected  审核驳回
+export type ReviewStatus = 'pending' | 'approved' | 'rejected';
+
+// 管理员视角的文档条目（审核队列列表项）
+export interface AdminDocument {
+  id: string; // 文档唯一 ID
+  filename: string; // 原始文件名
+  file_type: DocType; // 文档类型 word / markdown
+  status: DocStatus; // 生命周期状态（pending/approved/rejected/indexing/indexed）
+  review_status: ReviewStatus; // 审核结论（审核队列据此筛选）
+  size_bytes: number; // 文件字节数
+  uploader: string | null; // 提交人用户名（已注销为 null）
+  reviewer: string | null; // 审核人用户名（未审核为 null）
+  review_note: string | null; // 审核备注（驳回理由）
+  reviewed_at: string | null; // 审核时间（ISO 8601）
+  created_at: string; // 提交时间（ISO 8601）
+  // ---- P3-B2 入库状态字段（供管理员判断入库结果） ----
+  chunk_count: number; // 已入库切片数（0 表示未入库/已下线）
+  indexed_at: string | null; // 入库完成时间（ISO 8601）
+  last_index_error: string | null; // 最近一次入库失败原因（成功为空）
+}
+
+// GET /admin/documents 响应：当前页列表 + 总数（分页用）
+export interface AdminDocumentList {
+  items: AdminDocument[]; // 当前页文档列表
+  total: number; // 满足条件的总条数
+  limit: number; // 每页条数
+  offset: number; // 当前偏移量
+}
+
+// POST /admin/documents/{id}/review 请求体
+export interface ReviewPayload {
+  action: 'approved' | 'rejected'; // 审核动作：通过 / 驳回
+  note?: string; // 审核备注；驳回时必填理由（后端二次校验）
+}
+
+// POST /admin/documents/{id}/review 响应：回传更新后的文档，便于前端就地更新表格行
+export interface ReviewResultData {
+  document: AdminDocument;
+}
+
+// GET /admin/documents/{id}/preview 响应：文本预览
+export interface DocumentPreview {
+  id: string; // 文档唯一 ID
+  filename: string; // 原始文件名
+  file_type: DocType; // 文档类型
+  text: string; // 预览文本（可能已截断）
+  truncated: boolean; // 是否因超长被截断
+  previewable: boolean; // 是否成功提取出文本（false 时 text 为提示文案）
+}
+
+// =====================================================================
+// P3-B2：文档入库（RAG 管线）前端相关类型
+// 契约来源：《需求清单》P3 功能2「文档入库（RAG 管线）」
+//   - 前端：上传面板「我的文档」展示本人文档状态；管理员后台支持重新入库/下线
+//   - 后端：GET /documents（我的文档）、POST /admin/documents/{id}/index（重入库）、
+//          POST /admin/documents/{id}/unpublish（下线）
+// 字段与后端 MyDocumentOut / IndexResult 严格对齐（不驼峰转换，避免映射出错）。
+// =====================================================================
+
+// 用户视角的「我的文档」条目
+// status 取值：pending/approved/rejected/indexing/indexed
+// ⚠️ 入库失败并不会产生独立的 status 值，而是回退为 'approved' 并写入 last_index_error，
+//    因此前端需结合 last_index_error 区分「已通过待入库」与「入库失败」。
+export interface MyDocument {
+  id: string; // 文档唯一 ID
+  filename: string; // 原始文件名
+  file_type: DocType; // 文档类型 word / markdown
+  status: DocStatus; // 生命周期状态（indexed 即「已入库」）
+  review_status: ReviewStatus; // 审核结论（rejected 时展示驳回理由）
+  size_bytes: number; // 文件字节数
+  chunk_count: number; // 已入库切片数（>0 表示已入库）
+  review_note: string | null; // 驳回理由（被驳回时展示）
+  last_index_error: string | null; // 最近一次入库失败原因（成功为空）
+  created_at: string; // 提交时间（ISO 8601）
+  indexed_at: string | null; // 入库完成时间（ISO 8601）
+}
+
+// GET /documents 响应：当前登录用户提交的文档列表
+export interface MyDocumentList {
+  items: MyDocument[]; // 当前用户的文档列表（按提交时间倒序）
+  total: number; // 文档总条数
+}
+
+// 入库类操作（入库 / 重入库 / 下线）的统一响应
+// queued=True 表示已投递 Celery 异步执行（前端应展示「入库中」）；
+// queued=False 表示已在进程内同步执行（无 Redis 时的回退路径）。
+export interface IndexResult {
+  document: AdminDocument; // 操作后的文档（含最新入库状态）
+  queued: boolean; // 是否投递到 Celery 异步执行
+  message: string; // 可读的结果说明（便于前端提示）
+}

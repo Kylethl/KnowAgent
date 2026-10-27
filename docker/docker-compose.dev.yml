@@ -27,7 +27,13 @@
 services:
   # ---------- 数据库（唯一必需服务） ----------
   postgres:
-    image: postgres:16-alpine
+    # P3-Dep1：改用官方 pgvector 镜像（内置 vector 扩展），PostgreSQL 大版本仍为 16。
+    # 为什么换镜像：原 postgres:16-alpine 无法装 PG16 的 pgvector ——
+    #   Alpine 仓库里的 postgresql-pgvector 是针对 PG18 编译的（装在 /usr/lib/postgresql18），
+    #   与镜像自带的 PG16（/usr/local）ABI 不兼容，CREATE EXTENSION 会找不到控制文件。
+    # 迁移注意：本镜像基于 Debian（postgres 用户 uid=999），而 alpine 版为 uid=70；
+    #   已有数据卷首次启动前需把属主改为 999:999，否则会因权限不足启动失败。
+    image: pgvector/pgvector:pg16
     environment:
       # 与 backend DATABASE_URL 保持一致（postgres 镜像会据此自动建库建用户）
       POSTGRES_USER: knowagent
@@ -36,6 +42,8 @@ services:
     volumes:
       # 命名卷持久化数据；与正式 compose 共用 docker_pgdata，切换不丢数据
       - pgdata:/var/lib/postgresql/data
+      # 首次初始化数据卷时自动启用 pgvector 扩展（已有数据卷不会重复执行该目录脚本）
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     ports:
       # 映射到宿主机，便于后端（原生 uvicorn）与 psql 直连
       - "5432:5432"
@@ -44,6 +52,25 @@ services:
       test: ["CMD-SHELL", "pg_isready -U knowagent"]
       interval: 5s
       timeout: 5s
+      retries: 10
+
+  # ---------- 缓存 / 消息队列（P3-Dep1：Celery 异步入库的依赖） ----------
+  # 说明：P3 功能2 的「解析 → 切片 → embedding → 写向量」由 Celery worker 异步执行，
+  #       Redis 作为 broker + result backend。本地未启动 Redis 时，
+  #       后端会自动回退为「进程内后台任务」，保证开发期也能跑通入库闭环。
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]  # 开启 AOF，重启不丢队列
+    volumes:
+      # 命名卷持久化 AOF，避免容器重建丢失未消费任务
+      - redisdata:/data
+    ports:
+      # 映射到宿主机，便于 redis-cli 直连排查
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 10
 
   # ---------- 数据库可视化管理（可选，开发看库用） ----------
@@ -63,3 +90,5 @@ services:
 volumes:
   # 与主 compose 同名的命名卷，保证数据在两种编排间共享
   pgdata:
+  # Redis AOF 持久化卷（Celery 队列与结果）
+  redisdata:

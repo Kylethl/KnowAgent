@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Alert, message } from 'antd';
 import TopBar from '../components/TopBar';
 import MessageList from '../components/MessageList';
@@ -13,6 +14,7 @@ import {
   listConversations,
 } from '../services/conversationApi';
 import type { ChatMessage, ConversationSummary } from '../types';
+import { useAuth } from '../hooks/useAuth';
 
 // 对话页面：组合「左侧会话列表 / 顶部标题栏 / 中央消息区 / 底部输入框」四块，
 // 整体采用豆包式居中窄栏布局。
@@ -38,8 +40,13 @@ export default function ChatPage() {
       },
     });
 
-  // P1-F3：上传抽屉的展开状态（由顶部按钮开启，抽屉内关闭）
-  const [uploadOpen, setUploadOpen] = useState(false);
+// P2-F2：当前登录用户与登出方法（顶栏展示用户名、提供退出登录入口）
+const { user, logout } = useAuth();
+// P3-F1：路由跳转（顶栏「管理后台」入口跳 /admin；仅管理员可见该入口）
+const navigate = useNavigate();
+
+// P1-F3：上传抽屉的展开状态（由顶部按钮开启，抽屉内关闭）
+const [uploadOpen, setUploadOpen] = useState(false);
 
   // 拉取会话列表（P2-F1）
   const refreshConversations = useCallback(async () => {
@@ -127,8 +134,15 @@ export default function ChatPage() {
 
       {/* 右侧主区域：纵向 flex 占满剩余宽度 */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-        {/* P1-F3：顶部栏传入「上传文档」回调，点击即展开抽屉 */}
-        <TopBar onUploadClick={() => setUploadOpen(true)} />
+        {/* P1-F3：顶部栏传入「上传文档」回调；P2-F2：传入用户与登出回调；
+            P3-F1：传入「管理后台」跳转回调（TopBar 内部仅在 role=admin 时渲染该入口）。
+            注意：本页即对话页，故不传 onHomeClick —— 品牌区保持纯展示，不做无意义跳转。 */}
+        <TopBar
+          onUploadClick={() => setUploadOpen(true)}
+          user={user}
+          onLogout={logout}
+          onAdminClick={() => navigate('/admin')}
+        />
         {/* 中间区域：横向居中，限制内容最大宽度，呈现豆包式窄栏对话 */}
         <div
           style={{

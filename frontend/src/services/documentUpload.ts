@@ -1,4 +1,5 @@
 import type { DocType, DocumentRecord } from '../types';
+import { getToken, triggerUnauthorized } from './http';
 
 // P1-F3：文档上传服务
 // 职责：把用户选择的 Word / Markdown 文件以 multipart/form-data 上传到后端，
@@ -141,6 +142,13 @@ export function uploadDocument(
 
   xhr.open('POST', UPLOAD_ENDPOINT);
 
+  // P2-F2：附带 JWT。上传走 XMLHttpRequest（为拿上传进度），可以正常设置请求头，
+  // 优于 SSE 只能把令牌放 query 的做法。提交人由后端从令牌解析，前端不再传 user_id。
+  const token = getToken();
+  if (token) {
+    xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+  }
+
   // 传输进度：只在能算出总量时上报，上限压到 95% 留出服务端处理时间
   xhr.upload.onprogress = (event: ProgressEvent) => {
     if (!event.lengthComputable) return;
@@ -193,6 +201,11 @@ function parseErrorMessage(xhr: XMLHttpRequest): string {
     if (typeof body.detail === 'string') return body.detail;
   } catch {
     // 响应体不是 JSON（如 nginx 的 HTML 错误页），落到状态码兜底
+  }
+  if (xhr.status === 401) {
+    // 令牌失效：清理本地状态并跳登录页（上传走 XHR，不走 requestJson，需手动触发）
+    triggerUnauthorized();
+    return '登录已失效，请重新登录';
   }
   if (xhr.status === 404) return '上传接口不存在，后端 P1-B2 尚未实现';
   if (xhr.status === 413) return `文件过大，超过服务端 ${MAX_FILE_SIZE_MB}MB 限制`;

@@ -1,15 +1,17 @@
-import { useMemo } from 'react';
-import { Alert, Button, Drawer, Empty, Tag, Typography } from 'antd';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Alert, Button, Drawer, Empty, Spin, Tag, Typography } from 'antd';
 import {
   DeleteOutlined,
   FileMarkdownOutlined,
   FileWordOutlined,
   RedoOutlined,
+  ReloadOutlined,
 } from '@ant-design/icons';
 import { useDocumentUpload } from '../hooks/useDocumentUpload';
 import { formatFileSize } from '../services/documentUpload';
-import type { DocType, UploadItem } from '../types';
-import DocumentStatusTag from './DocumentStatusTag';
+import { getMyDocuments } from '../services/documentApi';
+import type { DocType, MyDocument, UploadItem } from '../types';
+import DocumentStatusTag, { DocumentStatusBadge } from './DocumentStatusTag';
 import UploadDropzone from './UploadDropzone';
 
 // P1-F3：文档上传面板（右侧抽屉）
@@ -39,6 +41,31 @@ export default function UploadPanel({ open, onClose }: Props) {
     [items]
   );
 
+  // 「我的文档」：本人提交的文档列表（含入库状态）。
+  // 抽屉打开时拉取一次；提供刷新按钮手动刷新（如刚上传/管理员刚入库）。
+  const [myDocs, setMyDocs] = useState<MyDocument[]>([]);
+  const [myLoading, setMyLoading] = useState(false);
+  const [myError, setMyError] = useState<string | null>(null);
+
+  /** 拉取「我的文档」列表（出错只提示，不影响上传区使用）。 */
+  const fetchMyDocs = useCallback(async () => {
+    setMyLoading(true);
+    setMyError(null);
+    try {
+      const res = await getMyDocuments();
+      setMyDocs(res.items);
+    } catch (err) {
+      setMyError(err instanceof Error ? err.message : '加载我的文档失败');
+    } finally {
+      setMyLoading(false);
+    }
+  }, []);
+
+  // 抽屉每次打开都重新拉取，保证看到最新状态
+  useEffect(() => {
+    if (open) void fetchMyDocs();
+  }, [open, fetchMyDocs]);
+
   return (
     <Drawer
       title="上传文档"
@@ -58,12 +85,12 @@ export default function UploadPanel({ open, onClose }: Props) {
         ) : null
       }
     >
-      {/* 业务说明：让用户理解提交后的流程（P1 仅落库待审核，P3 才审核入库） */}
+      {/* 业务说明：让用户理解提交后的流程（P1 提交 → P3 审核 → P3 入库） */}
       <Alert
         type="info"
         showIcon
         message="文档提交后进入「待审核」状态"
-        description="管理员审核通过并完成解析入库后，才会参与知识库问答（审核与入库在后续阶段上线）。"
+        description="管理员审核通过并完成解析入库后，即可参与知识库问答。下方「我的文档」可查看每篇文档的审核/入库进度。"
         style={{ marginBottom: 16 }}
       />
 
@@ -103,8 +130,123 @@ export default function UploadPanel({ open, onClose }: Props) {
           </div>
         )}
       </div>
+
+      {/* 「我的文档」：本人提交的文档及其审核/入库状态（P3-B2 状态展示） */}
+      <div style={{ marginTop: 24 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            marginBottom: 12,
+          }}
+        >
+          <Typography.Title level={5} style={{ margin: 0 }}>
+            我的文档
+          </Typography.Title>
+          <Button
+            size="small"
+            type="text"
+            icon={<ReloadOutlined />}
+            onClick={() => void fetchMyDocs()}
+            loading={myLoading}
+          >
+            刷新
+          </Button>
+        </div>
+
+        {myLoading ? (
+          // 首屏加载：骨架占位，避免抽屉空白
+          <div style={{ textAlign: 'center', padding: '16px 0' }}>
+            <Spin />
+          </div>
+        ) : myError ? (
+          // 加载失败：给出原因，不阻断上传区
+          <Alert type="warning" showIcon message={myError} />
+        ) : myDocs.length === 0 ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="还没有提交过文档"
+            style={{ padding: '12px 0' }}
+          />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {myDocs.map((doc) => (
+              <MyDocRow key={doc.id} doc={doc} />
+            ))}
+          </div>
+        )}
+      </div>
     </Drawer>
   );
+}
+
+/**
+ * 「我的文档」中的一行：文件名 / 类型 / 大小 + 状态徽标 + 切片数 / 入库时间 / 失败原因。
+ */
+function MyDocRow({ doc }: { doc: MyDocument }) {
+  const meta = TYPE_META[doc.file_type];
+
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: '10px 12px',
+        border: '1px solid #f0f0f0',
+        borderRadius: 10,
+        background: '#fff',
+      }}
+    >
+      {/* 类型图标：按文档类型着色，便于快速区分 Word 与 Markdown */}
+      <span style={{ fontSize: 22, color: meta.color }}>{meta.icon}</span>
+
+      {/* 中间信息区：文件名 + 类型标签 + 大小 + 备注（驳回理由 / 入库失败原因） */}
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span
+            title={doc.filename}
+            style={{
+              maxWidth: 200,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              fontSize: 14,
+            }}
+          >
+            {doc.filename}
+          </span>
+          <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+            {meta.label}
+          </Tag>
+        </div>
+        <div style={{ marginTop: 2 }}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {formatFileSize(doc.size_bytes)}
+            {doc.chunk_count > 0 && ` · 切片 ${doc.chunk_count} 段`}
+            {doc.indexed_at && ` · 已入库 ${formatMyTime(doc.indexed_at)}`}
+          </Typography.Text>
+        </div>
+        {/* 驳回理由：以红字提示，便于用户修改后重新提交 */}
+        {doc.review_status === 'rejected' && doc.review_note && (
+          <div style={{ marginTop: 2, color: '#ff4d4f', fontSize: 12 }}>驳回理由：{doc.review_note}</div>
+        )}
+      </div>
+
+      {/* 右侧状态徽标：直接按文档生命周期状态渲染（含入库失败） */}
+      <DocumentStatusBadge status={doc.status} lastIndexError={doc.last_index_error} />
+    </div>
+  );
+}
+
+/** 把 ISO 时间字符串格式化为「年-月-日 时:分」；空/非法值返回占位符。 */
+function formatMyTime(iso: string | null): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 /**

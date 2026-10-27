@@ -8,7 +8,9 @@
 #     DELETE /conversations/{id}       软删除（标记 deleted_at，不物理删除）
 #
 # 隔离与鉴权：
-#   - 当前用户由 core/security.get_current_user_id 解析（P2-B2 前为占位 Demo 用户）；
+#   - 当前用户由 core/security.get_current_user_id 解析。
+#     P2 功能1 时它是「X-User-Id 占位 + Demo 用户回退」，P2-B2 落地真实鉴权后，
+#     该依赖已升级为「校验 JWT → 解出用户」，本文件无需改动即自动获得真实身份；
 #   - 每个查询都带 user_id 过滤，天然实现「会话/消息按 user_id 隔离」（P2-DB1）；
 #   - 越权访问统一返回 404（不区分「不存在」与「不属于你」）。
 #

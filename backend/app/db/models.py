@@ -18,6 +18,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -27,7 +28,14 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from pgvector.sqlalchemy import Vector
+
 from app.db.engine import Base
+
+# 向量维度：必须与 sql/004_p3_db2_vector.sql 中 vector(N) 的 N 一致，
+# 也与 config.EMBEDDING_DIM 对齐（qwen3-vl-embedding 取 1024）。
+# ⚠️ 三者任一变更都要同步，否则写入时会被 PG 以维度不匹配拒绝。
+EMBEDDING_DIM = 1024
 
 
 class User(Base):
@@ -194,7 +202,15 @@ class Document(Base):
     status: Mapped[str] = mapped_column(
         String(24), nullable=False, server_default=text("'pending'")
     )
-    # ---- P3 审核字段（本阶段仅建列，业务由 P3 填充） ----
+    # ---- P3 审核字段 ----
+    # 审核结论：pending(待审核) / approved(通过) / rejected(驳回)。
+    # 与 status 的区别（见 sql/003_p3_db1_review.sql 字段职责划分）：
+    #   status        整体生命周期，入库时会继续变为 indexing/indexed；
+    #   review_status 审核结论，一旦落定不再随入库流程变化，供审核队列筛选与统计。
+    #   两者在管理员审核动作中同步写入（见 review_service.review_document）。
+    review_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'pending'")
+    )
     # 审核人（管理员）
     reviewer_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True),
@@ -207,6 +223,11 @@ class Document(Base):
     reviewed_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
     # 入库后切片数（P3 向量化后回填）
     chunk_count: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    # ---- P3-DB2 入库字段 ----
+    # 最近一次成功入库的时间；未入库 / 已下线时为 NULL
+    indexed_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
+    # 最近一次入库失败原因；成功入库后置空（管理员据此排查「入库失败」）
+    last_index_error: Mapped[Optional[str]] = mapped_column(Text)
 
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -254,4 +275,77 @@ Document.__table__.append_constraint(
         ),
         name="ck_documents_status",
     )
+)
+# P3-DB1：审核结论取值约束，与 003 SQL 的 ck_documents_review_status 保持一致
+Document.__table__.append_constraint(
+    CheckConstraint(
+        Document.__table__.c.review_status.in_(["pending", "approved", "rejected"]),
+        name="ck_documents_review_status",
+    )
+)
+
+
+class DocumentChunk(Base):
+    """文档切片向量表（P3-DB2：RAG 管线的向量存储）。
+
+    对应 sql/004_p3_db2_vector.sql 的 document_chunks 表：
+      - 一行 = 文档的一个切片 + 该切片的 embedding 向量；
+      - doc_id 级联删除：文档被删时切片自动清理；
+      - (doc_id, chunk_index) 唯一：重入库可用同一序号覆盖，避免重复堆积。
+
+    写入方式（见 services/indexing_service.py）：
+      解析 → 切片 → 批量 embedding → 批量 INSERT。
+    """
+
+    __tablename__ = "document_chunks"
+
+    # 切片主键
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    # 所属文档；文档删除时级联清理切片
+    doc_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 切片在文档内的序号（从 0 开始）
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 切片正文
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 切片估算 token 数（粗估，用于上下文预算与统计）
+    token_count: Mapped[Optional[int]] = mapped_column(Integer)
+    # 向量列：pgvector 的 vector(1024)。
+    # pgvector 提供的 Vector 类型负责 Python list ↔ PG vector 的转换，
+    # 写入时直接赋 list[float] 即可，查询时返回 list[float]。
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(EMBEDDING_DIM))
+    # 切片元信息：{filename, file_type, heading}，P4 引用卡片展示用
+    metadata_json: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DocumentChunk id={self.id} doc_id={self.doc_id} "
+            f"chunk_index={self.chunk_index}>"
+        )
+
+
+# 与 004 SQL 的 uq_document_chunks_doc_index 对应，保证 create_all 生成等价结构
+DocumentChunk.__table__.append_constraint(
+    CheckConstraint(
+        DocumentChunk.__table__.c.chunk_index >= 0,
+        name="ck_document_chunks_index_nonnegative",
+    )
+)
+# HNSW 向量索引（余弦距离）：P4 相似度召回的性能保障。
+# 与 004 SQL 同名；create_all 与 SQL 脚本二者任一先建都不会重复创建（IF NOT EXISTS）。
+Index(
+    "idx_document_chunks_embedding",
+    DocumentChunk.__table__.c.embedding,
+    postgresql_using="hnsw",
+    postgresql_ops={"embedding": "vector_cosine_ops"},
 )
