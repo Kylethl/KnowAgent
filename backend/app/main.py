@@ -16,6 +16,8 @@ from .api import auth as auth_router
 from .api import chat
 from .api import conversations as conversations_router
 from .api import documents as documents_router
+from .api import feedback as feedback_router
+from .api import notifications as notifications_router
 from .config import get_settings
 from .core.errors import (
     ForbiddenError,
@@ -27,6 +29,7 @@ from .core.errors import (
 from .core.logging import get_logger, setup_logging
 from .core.security import ensure_demo_user
 from .schemas import HealthResponse
+from .services import media_extract
 
 logger = get_logger(__name__)
 
@@ -164,6 +167,16 @@ def create_app() -> FastAPI:
     app.include_router(documents_router.router)
     # P3-B1：/admin/*（审核队列 / 通过驳回 / 预览）；路由级 require_admin 保证仅管理员可访问
     app.include_router(admin_router.router)
+    # P5：/admin/documents/{id}/media（媒体原文件流式预览）
+    # 单独注册的原因：该接口需支持 ?token= 传参（浏览器媒体标签无法带请求头），
+    # 因此不能挂在「只认请求头」的路由级 require_admin 之下。
+    app.include_router(admin_router.media_router)
+    # P6-B1：/notifications（站内信：列表 / 未读数 / 标记已读）
+    app.include_router(notifications_router.router)
+    # P6-B2：/messages/{id}/feedback（答案反馈：点赞 / 点踩 / 取消）
+    app.include_router(feedback_router.router)
+    # P6-B2：/admin/feedback/summary（答案质量评估概览，路由级 require_admin）
+    app.include_router(feedback_router.admin_router)
 
     @app.get("/health", response_model=HealthResponse, tags=["ops"], summary="健康检查")
     async def health() -> HealthResponse:
@@ -172,12 +185,17 @@ def create_app() -> FastAPI:
         llm_ready 为 False 表示未配置 DeepSeek Key——服务本身健康，但无法真实回答。
         """
         cfg = get_settings()
+        caps = media_extract.capabilities()
         return HealthResponse(
             # 无外部依赖（DB/Redis 尚未接入），进程在即视为 ok
             status="ok",
             app=cfg.APP_NAME,
             env=cfg.APP_ENV,
             llm_ready=cfg.is_deepseek_configured,
+            # P5：多模态解析能力（图片 OCR / 音视频 ASR），便于部署后一眼确认是否可用
+            media_ocr_ready=bool(caps["ocr"]),
+            media_asr_ready=bool(caps["asr"]),
+            media_ffmpeg=bool(caps["ffmpeg"]),
         )
 
     return app

@@ -30,7 +30,12 @@ def _fake_conv(id, title=None):
     )()
 
 
-def _fake_msg(id, role, content):
+def _fake_msg(id, role, content, citations=None):
+    """构造消息替身。
+
+    citations 必须存在（可为 None）：P4-B2 起历史接口会读取 messages.citations
+    来还原引用卡片，替身缺字段会让接口在序列化阶段报 AttributeError。
+    """
     return type(
         "Msg",
         (),
@@ -39,6 +44,7 @@ def _fake_msg(id, role, content):
             "role": role,
             "content": content,
             "created_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+            "citations": citations,
         },
     )()
 

@@ -36,3 +36,11 @@ body {
   background: currentColor;
   animation: typing-blink 1s steps(1) infinite;
 }
+
+/* 引用卡片（P4-F2）：hover / 键盘聚焦时轻微抬升，提示「可点击查看原文」 */
+.citation-card:hover,
+.citation-card:focus-visible {
+  border-color: #b7cafc;
+  box-shadow: 0 1px 6px rgba(56, 107, 243, 0.12);
+  outline: none;
+}

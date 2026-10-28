@@ -24,8 +24,8 @@ class DocumentUploadResponse(BaseModel):
 
     id: str = Field(..., description="文档唯一 ID（后端 UUID）")
     filename: str = Field(..., description="原始文件名（展示用）")
-    # 文档类型：word（.doc/.docx）/ markdown（.md）
-    type: str = Field(..., description="文档类型：word / markdown")
+    # 文档类型：word（.doc/.docx）/ markdown（.md）/ image / audio / video（P5）
+    type: str = Field(..., description="文档类型：word / markdown / image / audio / video")
     # 生命周期状态：P1 上传成功固定为 pending（待审核）
     status: str = Field(..., description="文档状态：pending / indexed / rejected")
     # 文件字节数（对应库内 size_bytes）
@@ -66,6 +66,10 @@ class HealthResponse(BaseModel):
     env: str = Field(..., description="运行环境")
     # 大模型是否配置了可用 Key，便于排查「能访问但答不了」的问题
     llm_ready: bool = Field(..., description="DeepSeek 是否已配置可用 API Key")
+    # ---- P5：多模态解析能力（部署自检用） ----
+    media_ocr_ready: bool = Field(False, description="图片 OCR 是否可用（模型 Key 已配置）")
+    media_asr_ready: bool = Field(False, description="音视频 ASR 是否可用（模型 Key 已配置）")
+    media_ffmpeg: bool = Field(False, description="是否找到可用的 ffmpeg（视频提音轨/音频切片）")
 
 
 # =====================================================================
@@ -99,6 +103,36 @@ class ConversationSummary(ConversationOut):
     message_count: int = Field(..., description="该会话下的消息条数")
 
 
+class CitationOut(BaseModel):
+    """单条答案引用来源（P4-B2 / P4-F2 契约）。
+
+    契约来源：《需求清单》P4 功能2
+      - 后端：`/chat` 返回 cite 列表（doc_id + chunk 片段）
+      - 前端：回答下方展示引用文档卡片（标题、片段、可跳转）
+      - 数据存储：引用关系存 messages 附加字段
+
+    字段与 services/retriever.build_citations() 的输出严格一致，
+    该字典同时用于 SSE citations 帧与 messages.citations 持久化，
+    保证「实时下发的」与「历史回看的」结构完全相同，前端只需一套渲染逻辑。
+    """
+
+    # 资料编号：与 Prompt 中 [1][2] 标注、回答正文里的编号一一对应
+    index: int = Field(..., description="资料编号（对应回答中的 [n] 标注）")
+    doc_id: str = Field(..., description="来源文档 ID（跳转原文用）")
+    doc_title: str = Field(..., description="来源文档标题（原文件名）")
+    file_type: str = Field("", description="文档类型：word / markdown")
+    # 切片 ID 与序号：跳转定位到具体片段
+    chunk_id: str = Field(..., description="切片 ID（跳转原文片段用）")
+    chunk_index: int = Field(0, description="切片在文档内的序号（从 0 开始）")
+    heading: str = Field("", description="所属章节标题（可为空）")
+    snippet: str = Field(..., description="片段摘要（已截断，卡片展示用）")
+    # 相关度：score 为综合排序分；vector_score 为语义相似度（展示更直观）
+    score: float = Field(0.0, description="综合排序分")
+    vector_score: float = Field(0.0, description="语义相似度（0~1）")
+    # 是否被回答真正引用：False 表示「作为参考资料注入但模型未标注引用」
+    cited: bool = Field(False, description="是否被回答直接引用")
+
+
 class ConversationMessageOut(BaseModel):
     """历史消息项：对应 messages 表的一行。"""
 
@@ -106,6 +140,16 @@ class ConversationMessageOut(BaseModel):
     role: str = Field(..., description="角色：user / assistant / system")
     content: str = Field(..., description="消息正文")
     created_at: str = Field(..., description="发送时间（ISO 8601）")
+    # P4-B2：助手消息的引用来源（user 消息与「当时未启用检索」的旧消息为空）
+    citations: List[CitationOut] = Field(
+        default_factory=list, description="该条回答的引用来源（P4 功能2）"
+    )
+    # P6-F2：当前登录用户对这条回答的反馈（未评价 / 非助手消息为 None）。
+    # 必须随历史一起下发：否则刷新页面后点赞/点踩按钮会「忘记」已评价过，
+    # 用户会重复提交，且看不到自己当时填的差评原因。
+    feedback: Optional["FeedbackOut"] = Field(
+        default=None, description="当前用户对该回答的反馈（P6 功能2）"
+    )
 
 
 class ConversationDetail(ConversationOut):
@@ -207,6 +251,31 @@ class AdminDocumentOut(BaseModel):
     last_index_error: Optional[str] = Field(
         default=None, description="最近一次入库失败原因（成功为空）"
     )
+    # ---- 入库状态自愈（P5 修复：僵死任务可重新入库） ----
+    # True 表示 status='indexing' 但已超过阈值仍未完成——上次入库被中断（进程重启 /
+    # worker 被杀），任务不会再自行结束。前端据此**放开**「重新入库」按钮，
+    # 否则该文档会永久卡在入库中，管理员只剩「预览」可用。
+    indexing_stale: bool = Field(
+        default=False, description="是否停留在入库中且已超时（可重新入库）"
+    )
+    # 停留在 indexing 的已持续秒数（非 indexing 为 None），用于提示「已卡住 N 分钟」
+    indexing_elapsed_seconds: Optional[int] = Field(
+        default=None, description="入库中已持续秒数（非入库中为空）"
+    )
+    # ---- P4：向量时效性（防「mock 向量 / 旧模型向量」混入检索） ----
+    # 入库时使用的向量模型签名：模型名，或未配置 Key 时的 "mock"；历史数据为 None
+    embedding_model: Optional[str] = Field(
+        default=None, description="入库时使用的向量模型签名（mock 或模型名）"
+    )
+    # True 表示向量与当前配置不可比（mock/换模型/历史未记录），建议重新入库
+    embedding_stale: bool = Field(
+        default=False, description="向量是否已过期（建议重新入库）"
+    )
+    # ---- P5：多模态解析元信息（图片/音视频入库后才有值） ----
+    # 形如 {kind, provider, model, chars, duration_seconds, segments, extractor}
+    extract_meta: Optional[dict] = Field(
+        default=None, description="OCR/ASR 解析元信息（文档类为空）"
+    )
 
 
 class AdminDocumentListResponse(BaseModel):
@@ -244,11 +313,15 @@ class DocumentPreviewResponse(BaseModel):
 
     id: str = Field(..., description="文档唯一 ID")
     filename: str = Field(..., description="原始文件名")
-    file_type: str = Field(..., description="文档类型：word / markdown")
+    file_type: str = Field(..., description="文档类型：word / markdown / image / audio / video")
     text: str = Field(..., description="预览文本（可能已截断）")
     truncated: bool = Field(..., description="是否因超长被截断")
     # 无法解析（如旧版 .doc）时给出说明，前端据此提示管理员下载查看
     previewable: bool = Field(..., description="是否成功提取出文本内容")
+    # P5：多模态解析元信息（图片/音视频），前端据此展示「OCR/ASR 用了哪个模型、耗时多久」
+    extract_meta: Optional[dict] = Field(
+        default=None, description="OCR/ASR 解析元信息（文档类为空）"
+    )
 
 
 # =====================================================================
@@ -297,6 +370,19 @@ class MyDocumentOut(BaseModel):
     last_index_error: Optional[str] = Field(
         default=None, description="最近一次入库失败原因（成功为空）"
     )
+    # ---- P4：向量时效性（用户侧同样需要知道「为什么检索不到我刚入库的文档」） ----
+    # 入库时使用的向量模型签名：模型名，或未配置 Key 时的 "mock"；历史数据为 None
+    embedding_model: Optional[str] = Field(
+        default=None, description="入库时使用的向量模型签名（mock 或模型名）"
+    )
+    # True 表示向量已过期（mock 向量 / 换过模型 / 历史未记录），需重新入库才能参与检索
+    embedding_stale: bool = Field(
+        default=False, description="向量是否已过期（建议联系管理员重新入库）"
+    )
+    # ---- P5：多模态解析元信息（图片/音视频入库后才有值） ----
+    extract_meta: Optional[dict] = Field(
+        default=None, description="OCR/ASR 解析元信息（文档类为空）"
+    )
 
 
 class MyDocumentListResponse(BaseModel):
@@ -306,3 +392,207 @@ class MyDocumentListResponse(BaseModel):
         default_factory=list, description="当前用户的文档列表（按提交时间倒序）"
     )
     total: int = Field(..., description="文档总条数")
+
+
+# =====================================================================
+# 引用原文片段（P4-F2「可跳转」的落地接口）
+# ---------------------------------------------------------------------
+# 为什么需要它：
+#   《需求清单》要求引用卡片「可跳转」。知识库是共享的，但用户手上没有
+#   原文文件（也不该为此开放文件下载），因此提供「按 chunk_id 取片段正文」的只读接口：
+#   点击引用卡片即在此展开该段原文（含相邻片段导航），既满足跳转语义，
+#   又不扩大数据暴露面（仅限已入库文档，且不提供原始文件）。
+# =====================================================================
+
+
+class ChunkDetailResponse(BaseModel):
+    """GET /documents/{doc_id}/chunks/{chunk_id} 的响应。"""
+
+    doc_id: str = Field(..., description="文档 ID")
+    doc_title: str = Field(..., description="文档标题（原文件名）")
+    file_type: str = Field("", description="文档类型：word / markdown")
+    chunk_id: str = Field(..., description="切片 ID")
+    chunk_index: int = Field(..., description="切片在文档内的序号（从 0 开始）")
+    total_chunks: int = Field(..., description="该文档的切片总数（用于「第 n/N 段」展示）")
+    heading: str = Field("", description="所属章节标题（可为空）")
+    content: str = Field(..., description="切片完整正文（非摘要）")
+    # 相邻切片 ID：前端据此提供「上一段 / 下一段」，让用户能看到上下文
+    prev_chunk_id: Optional[str] = Field(default=None, description="上一段切片 ID")
+    next_chunk_id: Optional[str] = Field(default=None, description="下一段切片 ID")
+
+
+# =====================================================================
+# P6 功能1：审核通知（站内信）
+# ---------------------------------------------------------------------
+# 契约来源：《需求清单》P6 功能1「审核通知」
+#   - 前端：站内信 / Toast 提示「文档已通过 / 被驳回」
+#   - 后端：状态变更触发通知；数据存储 notifications 表
+# 字段命名与前端 NotificationItem 严格对齐，便于直接反序列化。
+#
+# 设计取舍：type 用字符串枚举（document_approved / document_rejected），
+# 前端据此决定图标与配色；title/content 是审核时的快照，不随文档变更而改写。
+# =====================================================================
+
+# 通知类型：审核通过 / 审核驳回（与 notifications.type 的 CHECK 约束一致）
+NotificationType = Literal["document_approved", "document_rejected"]
+
+
+class NotificationOut(BaseModel):
+    """单条站内信（列表项 / Toast 数据源）。"""
+
+    id: str = Field(..., description="通知唯一 ID")
+    type: str = Field(..., description="通知类型：document_approved / document_rejected")
+    title: str = Field(..., description="标题（一句话结论）")
+    content: str = Field(..., description="正文（含文件名与驳回理由等细节）")
+    # 关联文档：前端可据此定位「我的文档」中的条目；文档被清理后为 None
+    doc_id: Optional[str] = Field(default=None, description="关联文档 ID（可空）")
+    # 已读时间：None 表示未读。前端据此渲染未读圆点
+    read_at: Optional[str] = Field(default=None, description="已读时间（ISO 8601，空=未读）")
+    created_at: str = Field(..., description="创建时间（ISO 8601）")
+
+
+class NotificationListResponse(BaseModel):
+    """GET /notifications 的响应：当前页 + 总数 + 未读数。"""
+
+    items: List[NotificationOut] = Field(default_factory=list, description="当前页通知")
+    total: int = Field(..., description="满足条件的总条数")
+    unread_count: int = Field(..., description="当前用户的未读通知数（角标）")
+    limit: int = Field(..., description="每页条数")
+    offset: int = Field(..., description="当前偏移量")
+
+
+class NotificationUnreadResponse(BaseModel):
+    """GET /notifications/unread-count 的响应（轻量轮询接口）。
+
+    单独提供的原因：前端每 30 秒轮询一次未读数，若每次都拉完整列表，
+    会白白传输正文并抬高数据库压力，只回一个数字最省。
+    """
+
+    unread_count: int = Field(..., description="未读通知数")
+
+
+class NotificationReadResponse(BaseModel):
+    """标记已读的响应：回传最新未读数，前端无需再请求一次。"""
+
+    notification: NotificationOut = Field(..., description="被标记的通知")
+    unread_count: int = Field(..., description="标记后剩余的未读数")
+
+
+class NotificationReadAllResponse(BaseModel):
+    """全部标记已读的响应。"""
+
+    updated: int = Field(..., description="本次标记为已读的条数")
+    unread_count: int = Field(0, description="标记后的未读数（恒为 0）")
+
+
+# =====================================================================
+# P6 功能2：答案反馈与评估
+# ---------------------------------------------------------------------
+# 契约来源：《需求清单》P6 功能2「答案反馈与评估」
+#   - 前端：回答点赞/点踩按钮 + 反馈表单
+#   - 后端：/messages/{id}/feedback 存储反馈；反馈用于后续离线优化
+#   - 数据存储：feedback 表
+#
+# 说明：评价对象是「一条助手回答」（messages.id），不是会话——
+# 只有精确到单条回答，才能做「哪类问题答不好」的归因分析。
+# =====================================================================
+
+# 评价结论：点赞 / 点踩（与前端的两个按钮一一对应）
+FeedbackRating = Literal["up", "down"]
+
+# 点踩归因：答非所问 / 内容错误 / 资料不符 / 其他
+# 这套分类直接对应后续优化动作：
+#   off_topic   → 调整 prompt 的角色与回答范围
+#   wrong       → 检查模型能力或补充知识库内容
+#   unsupported → 检查检索召回与引用标注
+#   other       → 人工查看详情
+FeedbackReason = Literal["off_topic", "wrong", "unsupported", "other"]
+
+# 反馈备注的最大长度：与 service 层校验保持一致，防止超长文本进库
+FEEDBACK_COMMENT_MAX_LEN = 1000
+
+
+class FeedbackRequest(BaseModel):
+    """POST /messages/{message_id}/feedback 的请求体。
+
+    安全约定：不接受 message_id / user_id —— 前者来自路径，后者由 JWT 解析，
+    杜绝「替别人提交反馈」或「给不属于自己的消息刷评价」。
+    """
+
+    rating: FeedbackRating = Field(..., description="评价结论：up（赞）/ down（踩）")
+    # 点踩归因：可选（后端不强制，避免为了提交评价而卡住用户），前端表单会引导填写
+    reason: Optional[FeedbackReason] = Field(
+        default=None, description="点踩归因：off_topic / wrong / unsupported / other"
+    )
+    # 补充说明：可选，自由文本；超过 FEEDBACK_COMMENT_MAX_LEN 由服务端拒绝
+    comment: Optional[str] = Field(
+        default=None, description=f"补充说明（可选，最多 {FEEDBACK_COMMENT_MAX_LEN} 字）"
+    )
+
+
+class FeedbackOut(BaseModel):
+    """单条反馈的对外视图（提交结果 / 历史回显共用）。"""
+
+    id: str = Field(..., description="反馈唯一 ID")
+    message_id: str = Field(..., description="被评价的消息 ID")
+    rating: str = Field(..., description="评价结论：up / down")
+    reason: Optional[str] = Field(default=None, description="点踩归因（点赞为空）")
+    comment: Optional[str] = Field(default=None, description="补充说明")
+    created_at: str = Field(..., description="首次提交时间（ISO 8601）")
+    updated_at: str = Field(..., description="最近修改时间（ISO 8601）")
+
+
+class FeedbackStateResponse(BaseModel):
+    """GET /messages/{message_id}/feedback 的响应。
+
+    feedback 为 None 表示「当前用户还没评价过这条回答」——
+    前端据此把点赞/点踩按钮置为未选中。
+    """
+
+    message_id: str = Field(..., description="消息 ID")
+    feedback: Optional[FeedbackOut] = Field(default=None, description="当前用户的反馈（可为空）")
+
+
+class FeedbackDownItem(BaseModel):
+    """管理员评估视图中的一条差评（含上下文，便于定位问题）。"""
+
+    feedback_id: str = Field(..., description="反馈 ID")
+    message_id: str = Field(..., description="被评价的回答消息 ID")
+    conversation_id: str = Field(..., description="所属会话 ID")
+    question: str = Field("", description="该回答对应的用户提问（取同会话上一条用户消息）")
+    answer: str = Field("", description="回答正文摘要（已截断）")
+    reason: Optional[str] = Field(default=None, description="点踩归因")
+    comment: Optional[str] = Field(default=None, description="用户补充说明")
+    created_at: str = Field(..., description="提交时间（ISO 8601）")
+
+
+class FeedbackSummaryResponse(BaseModel):
+    """GET /admin/feedback/summary 的响应：答案质量评估概览。
+
+    《需求清单》P6 功能2 把反馈定位为「用于后续 prompt/检索离线优化」，
+    因此除了计数，还给出归因分布与最近的差评明细——这才是可行动的评估数据。
+    """
+
+    total: int = Field(0, description="反馈总数")
+    up_count: int = Field(0, description="点赞数")
+    down_count: int = Field(0, description="点踩数")
+    # 好评率（0~1）：分母为 0 时记 0，避免除零
+    up_rate: float = Field(0.0, description="好评率（0~1，无数据时为 0）")
+    # 归因分布：{off_topic: 3, wrong: 1, ...}，只统计点踩且填写了归因的记录
+    reason_breakdown: dict = Field(
+        default_factory=dict, description="点踩归因分布（键为归因代码，值为条数）"
+    )
+    recent_down: List[FeedbackDownItem] = Field(
+        default_factory=list, description="最近的差评明细（按时间倒序）"
+    )
+
+
+# ---------------------------------------------------------------------
+# 前向引用解析（P6）
+# ---------------------------------------------------------------------
+# ConversationMessageOut 在 P6 之前定义，其 feedback 字段引用了本文件末尾的 FeedbackOut，
+# 因此需要显式 rebuild 一次，让 Pydantic 在模块加载完成后解析该引用。
+# 若不调用，FastAPI 在生成 OpenAPI / 校验响应时会报
+# "FeedbackOut is not defined"（Pydantic v2 对未解析前向引用直接报错）。
+ConversationMessageOut.model_rebuild()
+ConversationDetail.model_rebuild()

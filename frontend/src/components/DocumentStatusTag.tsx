@@ -1,11 +1,14 @@
 import { Progress, Tag, Tooltip, Typography } from 'antd';
-import type { DocStatus, UploadItem } from '../types';
+import type { DocStatus, DocType, UploadItem } from '../types';
 
 // P1-F3：上传项状态标签
 // 把「本地上传状态」映射为用户能看懂的展示：
 //   uploading → 实时进度条（含服务端处理中的等待态）
 //   success   → 按后端返回的文档状态展示标签（P1 只会出现「待审核」）
 //   error     → 「上传失败」标签
+//
+// P5：图片/音频/视频在入库阶段要做 OCR/ASR，这一步耗时明显长于文本解析，
+//     因此入库中的文案按类型区分——媒体显示「解析中」，让用户知道在等模型而不是卡住。
 
 // 文档状态 → 标签文案与颜色
 // 取值覆盖后端 documents.status 的全部 5 种（见 sql/002_p1_db2_documents.sql）；
@@ -19,6 +22,20 @@ export const STATUS_META: Record<DocStatus, { label: string; color: string }> = 
   rejected: { label: '已驳回', color: 'red' },
 };
 
+// 媒体类型集合：用于判断是否需要展示「解析中」
+const MEDIA_TYPES: readonly DocType[] = ['image', 'audio', 'video'];
+
+/**
+ * 按「状态 + 文件类型」给出展示文案。
+ * 媒体类在 indexing 阶段实际是 OCR/ASR 解析，文案用「解析中」更准确。
+ */
+export function statusLabel(status: DocStatus, fileType?: DocType | null): string {
+  if (status === 'indexing' && fileType && MEDIA_TYPES.includes(fileType)) {
+    return '解析中';
+  }
+  return STATUS_META[status].label;
+}
+
 /**
  * 直接展示文档生命周期状态的徽标（不依赖上传队列项）。
  * 供「我的文档」列表、管理员后台状态列等「纯状态」场景复用。
@@ -28,13 +45,16 @@ export const STATUS_META: Record<DocStatus, { label: string; color: string }> = 
  *
  * @param status 文档生命周期状态
  * @param lastIndexError 最近一次入库失败原因（成功为空）；非空即视为「入库失败」
+ * @param fileType 文档类型（媒体类会把「入库中」显示为「解析中」）
  */
 export function DocumentStatusBadge({
   status,
   lastIndexError,
+  fileType,
 }: {
   status: DocStatus;
   lastIndexError?: string | null;
+  fileType?: DocType | null;
 }) {
   // 入库失败：status 已回退为 approved，用 lastIndexError 非空来判定
   if ((status === 'approved' || status === 'indexing') && lastIndexError) {
@@ -45,7 +65,7 @@ export function DocumentStatusBadge({
     );
   }
   const meta = STATUS_META[status];
-  return <Tag color={meta.color}>{meta.label}</Tag>;
+  return <Tag color={meta.color}>{statusLabel(status, fileType)}</Tag>;
 }
 
 
@@ -78,7 +98,8 @@ export default function DocumentStatusTag({ item }: Props) {
   if (item.status === 'success') {
     const docStatus: DocStatus = item.record?.status ?? 'pending';
     const meta = STATUS_META[docStatus];
-    return <Tag color={meta.color}>{meta.label}</Tag>;
+    // 媒体类在入库阶段显示「解析中」，与「我的文档」列表保持一致
+    return <Tag color={meta.color}>{statusLabel(docStatus, item.docType)}</Tag>;
   }
 
   // 上传失败

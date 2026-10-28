@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from app.api.documents import get_storage_dep
 from app.config import get_settings
+from app.core.security import get_current_user_id
 from app.db.engine import get_db
 from app.main import app
 from app.services import storage as storage_mod
@@ -109,7 +110,14 @@ def test_local_storage_roundtrip(tmp_path):
 # 3. 接口契约（FastAPI TestClient）
 # ---------------------------------------------------------------------
 class FakeSession:
-    """替身异步会话：记录 add/commit/refresh，模拟 DB 生成 id 与 created_at。"""
+    """替身异步会话：记录 add/commit/refresh，模拟 DB 生成 id 与 created_at。
+
+    说明：P2 给 /documents/upload 加上鉴权后，鉴权依赖会先于业务代码访问数据库
+    （查当前用户）。为了让本文件仍然只测「上传链路」，测试里用
+    dependency_overrides 覆盖鉴权依赖，不触发真实查询；因此这里的 execute
+    只作为兜底实现存在——若将来业务路径真的发起查询，会明确报「FakeSession 不支持」，
+    而不是抛一个难以定位的 AttributeError。
+    """
 
     def __init__(self):
         self.added = []
@@ -119,6 +127,13 @@ class FakeSession:
     def add(self, obj):
         # 注意：真实 AsyncSession.add 是同步方法（无需 await），故此处也用同步
         self.added.append(obj)
+
+    async def execute(self, *args, **kwargs):
+        """兜底实现：明确告知测试桩未模拟查询，避免误以为测试覆盖了查询逻辑。"""
+        raise NotImplementedError(
+            "FakeSession 未模拟 execute()：上传链路不应发起查询。"
+            "如需测试查询，请为本用例补充桩实现或用真实测试库。"
+        )
 
     async def commit(self):
         self.committed = True
@@ -134,14 +149,25 @@ class FakeSession:
         self.committed = False
 
 
+# 测试用固定用户 ID：与 FakeSession.refresh 造出的文档归属保持一致即可，
+# 本文件不校验归属（那是 /documents 列表接口与用户隔离测试的职责）。
+_FAKE_USER_ID = uuid4()
+
+
 @pytest.fixture
 def client_and_fakes(tmp_path):
-    """构造 TestClient 并注入 FakeSession + LocalStorage 依赖。"""
+    """构造 TestClient 并注入 FakeSession + LocalStorage 依赖。
+
+    P2-B2 起 /documents/upload 要求鉴权（AUTH_REQUIRED=true），
+    这里覆盖鉴权依赖注入固定用户，使本文件专注验证上传链路本身；
+    鉴权行为由 tests/test_auth.py 覆盖。
+    """
     fake_db = FakeSession()
     local_store = LocalStorage(root=tmp_path / "uploads")
 
     app.dependency_overrides[get_db] = lambda: fake_db
     app.dependency_overrides[get_storage_dep] = lambda: local_store
+    app.dependency_overrides[get_current_user_id] = lambda: _FAKE_USER_ID
 
     # 把存储根目录暴露出来，便于断言对象已落盘
     yield TestClient(app), fake_db, tmp_path / "uploads"
@@ -190,7 +216,9 @@ def test_upload_success_flow(client_and_fakes):
     assert body["status"] == "pending"          # P1 上传即待审核
     assert body["size"] == len(content)
     assert body["filename"] == "入门指南.md"
-    assert body["storage_path"].startswith("anonymous/")  # 无 user_id → anonymous 隔离目录
+    # P2 起提交人由令牌解析：对象路径按 user_id 隔离（P1 无鉴权时是 anonymous/）。
+    # 这里断言落在「当前用户」目录下，等价于验证了「用户间文件不混放」。
+    assert body["storage_path"].startswith(f"{_FAKE_USER_ID}/")
     assert "created_at" in body and body["created_at"]
 
     # 2) 存储侧：对象已落盘到本地目录

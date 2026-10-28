@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Drawer, Empty, Spin, Tag, Typography } from 'antd';
 import {
+  AudioOutlined,
   DeleteOutlined,
   FileMarkdownOutlined,
   FileWordOutlined,
+  PictureOutlined,
   RedoOutlined,
   ReloadOutlined,
+  VideoCameraOutlined,
 } from '@ant-design/icons';
 import { useDocumentUpload } from '../hooks/useDocumentUpload';
 import { formatFileSize } from '../services/documentUpload';
@@ -14,21 +17,36 @@ import type { DocType, MyDocument, UploadItem } from '../types';
 import DocumentStatusTag, { DocumentStatusBadge } from './DocumentStatusTag';
 import UploadDropzone from './UploadDropzone';
 
-// P1-F3：文档上传面板（右侧抽屉）
+// P1-F3 / P5-F1：文档上传面板（右侧抽屉）
 // 组成：业务说明 → 拖拽上传区 → 上传列表（进度 / 待审核标签 / 重试 / 移除）。
-// 对应《需求清单》P1 功能2 的前端部分：
-//   「上传入口（拖拽/选择），仅接受 .docx/.doc/.md，显示上传中状态与『待审核』标签」
+// 对应《需求清单》P5 功能1 的前端部分：
+//   「上传入口扩展，接受图片/音频/视频，显示类型标签与状态」
 
 interface Props {
   open: boolean; // 抽屉是否展开
   onClose: () => void; // 关闭回调
 }
 
-// 文档类型 → 展示文案与图标（P1 仅两种类型）
+// 文档类型 → 展示文案、颜色与图标（P1 两种 + P5 三种）
+// 图标与配色参考 antd 的语义色：Word 蓝、Markdown 浅蓝、图片绿、音频橙、视频紫
 const TYPE_META: Record<DocType, { label: string; color: string; icon: JSX.Element }> = {
   word: { label: 'Word', color: '#2b579a', icon: <FileWordOutlined /> },
   markdown: { label: 'Markdown', color: '#5191d1', icon: <FileMarkdownOutlined /> },
+  image: { label: '图片', color: '#389e0d', icon: <PictureOutlined /> },
+  audio: { label: '音频', color: '#d46b08', icon: <AudioOutlined /> },
+  video: { label: '视频', color: '#722ed1', icon: <VideoCameraOutlined /> },
 };
+
+/** 把秒数格式化为「m:ss」或「h:mm:ss」，未知返回 null。 */
+function formatDuration(seconds?: number | null): string | null {
+  if (!seconds || seconds <= 0) return null;
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
 
 export default function UploadPanel({ open, onClose }: Props) {
   // 上传队列的全部状态与操作均来自钩子，本组件只负责渲染
@@ -225,6 +243,10 @@ function MyDocRow({ doc }: { doc: MyDocument }) {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             {formatFileSize(doc.size_bytes)}
             {doc.chunk_count > 0 && ` · 切片 ${doc.chunk_count} 段`}
+            {/* P5：音视频显示时长，图片/音视频显示 OCR/ASR 识别出的字符数 */}
+            {formatDuration(doc.extract_meta?.duration_seconds) &&
+              ` · 时长 ${formatDuration(doc.extract_meta?.duration_seconds)}`}
+            {typeof doc.extract_meta?.chars === 'number' && ` · 识别 ${doc.extract_meta.chars} 字`}
             {doc.indexed_at && ` · 已入库 ${formatMyTime(doc.indexed_at)}`}
           </Typography.Text>
         </div>
@@ -232,10 +254,23 @@ function MyDocRow({ doc }: { doc: MyDocument }) {
         {doc.review_status === 'rejected' && doc.review_note && (
           <div style={{ marginTop: 2, color: '#ff4d4f', fontSize: 12 }}>驳回理由：{doc.review_note}</div>
         )}
+        {/* P4：向量过期提示 —— 文档虽显示「已入库」，但向量与当前模型不可比，
+            检索会失效或召回错误内容。用户无法自行重新入库，故引导联系管理员。 */}
+        {doc.embedding_stale && (
+          <div style={{ marginTop: 2, color: '#d46b08', fontSize: 12 }}>
+            向量已过期（入库模型：{doc.embedding_model ?? '未知'}），暂不参与知识库检索，
+            请联系管理员「重新入库」。
+          </div>
+        )}
       </div>
 
-      {/* 右侧状态徽标：直接按文档生命周期状态渲染（含入库失败） */}
-      <DocumentStatusBadge status={doc.status} lastIndexError={doc.last_index_error} />
+      {/* 右侧状态徽标：直接按文档生命周期状态渲染（含入库失败）；
+          媒体类在入库阶段显示「解析中」（OCR/ASR 比文本解析慢，文案要贴合实际） */}
+      <DocumentStatusBadge
+        status={doc.status}
+        lastIndexError={doc.last_index_error}
+        fileType={doc.file_type}
+      />
     </div>
   );
 }

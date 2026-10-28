@@ -34,6 +34,22 @@ services:
       timeout: 5s
       retries: 10
 
+  # ---------- 缓存 / 消息队列（P3-Dep1 引入，P5 复用） ----------
+  # 作用：① Celery broker/result backend（文档与媒体入库）；② 检索结果缓存（db2）
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    ports:
+      # 仅本地调试用；生产可删除，容器间走服务名 redis
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---------- 后端 FastAPI ----------
   backend:
     build: ../backend
@@ -53,10 +69,25 @@ services:
       # DeepSeek Key：由宿主机 .env 注入（见 .env.example）；
       # 缺省为空 → 服务可起但 /chat 返回「未配置」提示，不影响上传与页面。
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      # ---- P3/P5：Celery（容器内必须指向服务名 redis，不能是 localhost）----
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_CACHE_URL: redis://redis:6379/2
+      USE_CELERY: "true"
+      CELERY_MEDIA_QUEUE: media
+      # ---- P3/P5：向量与多模态（Key 由宿主机 .env 注入）----
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_EMBEDDING_BASE_URL: ${QWEN_EMBEDDING_BASE_URL:-}
+      QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-qwen3.7-text-embedding-flash}
+      MEDIA_OCR_MODEL: ${MEDIA_OCR_MODEL:-qwen3.5-ocr}
+      MEDIA_ASR_MODEL: ${MEDIA_ASR_MODEL:-qwen3.8-omni-flash}
+      MEDIA_EXTRACT_ENABLED: "true"
     volumes:
       - uploads:/app/data/uploads
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       # 便于直接调试后端；生产可删除，仅经 nginx 访问
@@ -67,6 +98,62 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # ---------- 文档入库 worker（默认队列） ----------
+  # 与 backend 共用镜像，只覆盖 entrypoint 为 celery worker。
+  # -Q celery：只消费默认队列，避免与媒体 worker 抢任务。
+  worker:
+    build: ../backend
+    entrypoint: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "-l", "info", "-Q", "celery", "-c", "2"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://knowagent:knowagent@postgres:5432/knowagent
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_DIR: /app/data/uploads
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_CACHE_URL: redis://redis:6379/2
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_EMBEDDING_BASE_URL: ${QWEN_EMBEDDING_BASE_URL:-}
+      QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-qwen3.7-text-embedding-flash}
+      LOG_LEVEL: INFO
+    volumes:
+      - uploads:/app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------- 媒体入库 worker（P5-Dep1：独立/可扩容） ----------
+  # 为什么单独一个服务：
+  #   OCR/ASR 需要把音视频转码（CPU 密集）并调用多模态模型（长耗时），
+  #   与普通文档入库放在同一 worker 会让「刚上传的 Word」排在长视频后面。
+  #   -c 1：一次只处理一个媒体任务，避免多个转码互相抢 CPU；
+  #   需要吞吐时横向扩容：docker compose up -d --scale media-worker=3。
+  media-worker:
+    build: ../backend
+    entrypoint: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "-l", "info", "-Q", "media", "-c", "1"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://knowagent:knowagent@postgres:5432/knowagent
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_DIR: /app/data/uploads
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      REDIS_CACHE_URL: redis://redis:6379/2
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      QWEN_EMBEDDING_BASE_URL: ${QWEN_EMBEDDING_BASE_URL:-}
+      QWEN_EMBEDDING_MODEL: ${QWEN_EMBEDDING_MODEL:-qwen3.7-text-embedding-flash}
+      MEDIA_EXTRACT_ENABLED: "true"
+      MEDIA_OCR_MODEL: ${MEDIA_OCR_MODEL:-qwen3.5-ocr}
+      MEDIA_ASR_MODEL: ${MEDIA_ASR_MODEL:-qwen3.8-omni-flash}
+      LOG_LEVEL: INFO
+    volumes:
+      - uploads:/app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   # ---------- 前端（nginx 托管 + 反代） ----------
   nginx:
@@ -80,3 +167,5 @@ services:
 volumes:
   pgdata:
   uploads:
+  # Redis AOF 持久化卷（Celery 队列与检索缓存）
+  redisdata:

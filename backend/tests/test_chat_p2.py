@@ -65,6 +65,20 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def stub_retrieval(monkeypatch):
+    """P4：隔离真实知识库检索（本文件只验证会话持久化，不关心检索）。
+
+    返回 disabled 使 /chat 走「无检索」分支，避免真实调用 embedding 接口。
+    """
+    from app.services.retriever import MODE_DISABLED, RetrievalResult
+
+    async def _fake_retrieval(query, db):
+        return RetrievalResult(mode=MODE_DISABLED, reason="测试环境未启用检索")
+
+    monkeypatch.setattr(chat_module, "retrieve_for_chat", _fake_retrieval)
+
+
 def _install_db_path(monkeypatch, conv_id: str, history, captured: dict):
     """装配「数据库可用」路径所需的全部桩。"""
     db = AsyncMock()
@@ -81,15 +95,17 @@ def _install_db_path(monkeypatch, conv_id: str, history, captured: dict):
         captured["history_requested"] = True
         return history
 
-    async def fake_append(dbsession, conversation_id, user_content, assistant_content):
+    async def fake_append(dbsession, conversation_id, user_content, assistant_content, citations=None):
         captured["appended"] = (user_content, assistant_content)
+        # P4-B2：记录本轮引用来源，供「引用是否随消息落库」的断言使用
+        captured["citations_saved"] = citations
 
     monkeypatch.setattr(chat_module.svc, "get_or_create_conversation", fake_get_or_create)
     monkeypatch.setattr(chat_module.svc, "load_history_window", fake_load_history)
     monkeypatch.setattr(chat_module.svc, "append_turn", fake_append)
 
     # 可控假流：记录入参并产出固定分片
-    async def fake_stream(message, conversation_id=None, history=None, meta=None, memory_enabled=True):
+    async def fake_stream(message, conversation_id=None, history=None, meta=None, memory_enabled=True, context=None):
         captured["memory_enabled"] = memory_enabled
         captured["history_passed"] = history
         if isinstance(meta, dict):

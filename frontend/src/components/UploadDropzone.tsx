@@ -7,9 +7,9 @@ import {
 } from 'react';
 import { InboxOutlined } from '@ant-design/icons';
 import { Typography } from 'antd';
-import { ALLOWED_EXTENSIONS, MAX_FILE_SIZE_MB } from '../services/documentUpload';
+import { ALLOWED_EXTENSIONS, MAX_SIZE_MB_BY_TYPE } from '../services/documentUpload';
 
-// P1-F3：文档拖拽上传区
+// P1-F3 / P5-F1：文档拖拽上传区
 // 职责：提供「点击选择 + 拖拽投放」两种入口，把拿到的 File 列表交给上层。
 //
 // 为什么不直接用 antd 的 Upload.Dragger：
@@ -99,7 +99,8 @@ export default function UploadDropzone({ onFiles, disabled = false }: Props) {
       </div>
       <div style={{ marginTop: 6 }}>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          仅支持 {ALLOWED_EXTENSIONS.join(' / ')}，单个文件不超过 {MAX_FILE_SIZE_MB}MB
+          支持 Word / Markdown、图片（{MAX_SIZE_MB_BY_TYPE.image}MB）、
+          音频（{MAX_SIZE_MB_BY_TYPE.audio}MB）、视频（{MAX_SIZE_MB_BY_TYPE.video}MB）
         </Typography.Text>
       </div>
 

@@ -8,6 +8,7 @@ import {
   UserOutlined,
 } from '@ant-design/icons';
 import type { AuthUser } from '../types';
+import NotificationBell from './NotificationBell';
 
 // 顶部标题栏组件（豆包风格：左侧品牌图标 + 产品名 + 副标题，右侧操作区）
 // 高度固定，作为对话页骨架的顶部区域。
@@ -15,6 +16,9 @@ import type { AuthUser } from '../types';
 // P1-F3：右侧新增「上传文档」入口，点击后由父组件打开上传抽屉。
 // P2-F2：右侧新增「当前用户 + 登出」入口，点击用户名可展开菜单执行登出。
 // P3-F1：管理员账号额外显示「管理后台」入口（普通用户不渲染，避免误导点击）。
+// P6-F1：右侧新增通知铃铛（站内信 + 审核结果 Toast）。
+//        放在顶栏的原因：对话页与管理后台都复用本组件，通知是全局能力，
+//        挂在这里即可覆盖所有登录页面，不必每页各写一遍轮询逻辑。
 // 小功能：左侧品牌区（图标 + 「知识库问答」）在传入 onHomeClick 时可点击返回对话页，
 //       例如从管理后台点它即可回到对话界面；对话页自身不传该回调，故品牌区不可点击。
 interface Props {
@@ -98,6 +102,11 @@ export default function TopBar({
 
       {/* 右侧操作区：marginLeft:auto 把它推到栏尾 */}
       <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
+        {/* P6-F1：通知铃铛（站内信 + 新通知 Toast）。
+            仅在已登录时渲染：未登录没有 user，通知也无从查起（接口会 401）。
+            放在「上传文档」左侧，符合"低频入口靠内、高频操作靠外"的视觉习惯。 */}
+        {user && <NotificationBell />}
+
         {/* P1-F3：上传入口（管理后台页不传该回调，故不渲染） */}
         {onUploadClick && (
           <Button icon={<CloudUploadOutlined />} onClick={onUploadClick}>

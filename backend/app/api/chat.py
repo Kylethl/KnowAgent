@@ -19,6 +19,28 @@
 #   - 会话回绑：流起始下发一帧 data: {"type":"conversation","id":"..."}，便于前端在「首次发送自动建会话」
 #     时拿到会话 ID 并绑定到左侧列表。
 #   - 容错：若数据库不可用（如本地开发未起 PG），自动回退到 P1 内存记忆路径，保证「无 DB 也能对话」。
+#
+# P4 增强（本次迭代：RAG 增强回答可见）：
+#   - 检索增强：回答前先做知识库检索（pgvector 相似度召回 → 重排 → 上下文拼装），
+#     把命中的资料注入 Prompt，使回答「有据可依」（见 services/retriever.py）。
+#   - 检索可见：在会话回绑帧之后、正文分片之前，额外下发一帧
+#         data: {"type":"retrieval","mode":"rag|no_hit|disabled|fallback","count":N,...}
+#     前端据此在助手气泡下方渲染「知识库检索 · 命中 N 段资料」等状态。
+#   - 降级优先：检索是增强项，任何失败（DB/向量接口/无库）都只影响 mode，
+#     绝不中断对话——无检索时退化为 P1/P2 的通用回答。
+#
+# P4 功能2 增强（答案引用来源）：
+#   - 引用来源：回答生成后解析正文中的 [n] 标注，映射回检索到的切片，
+#     在正文之后、[DONE] 之前追加一帧：
+#         data: {"type":"citations","items":[{index,doc_id,doc_title,chunk_id,snippet,...}]}
+#   - 引用持久化：同批引用写入 messages.citations（JSONB），
+#     历史回看（GET /conversations/{id}）原样回传，前端复用同一套卡片渲染。
+#
+# P6 功能2 增强（答案反馈与评估）：
+#   - 消息回执：本轮对话落库后、[DONE] 之前追加一帧
+#         data: {"type":"message","id":"<助手消息ID>","user_message_id":"<用户消息ID>"}
+#     前端据此把「本地临时气泡 ID」换成数据库主键，点赞/点踩才有目标
+#     （见 POST /messages/{id}/feedback）。
 
 import asyncio
 from typing import AsyncIterator, List, Optional
@@ -37,6 +59,7 @@ from ..db.engine import SessionLocal
 from ..schemas import ChatMessage, ChatRequest
 from ..services import conversation_service as svc
 from ..services.chat_chain import stream_answer
+from ..services.retriever import retrieve_for_chat, select_citations
 
 logger = get_logger(__name__)
 
@@ -131,8 +154,11 @@ async def _event_generator(
          - 新建/读取会话（user_id 隔离、归属校验）；
          - 下发 {"type":"conversation","id":...} 回绑帧；
          - 从数据库加载上下文窗口内历史，注入 LangChain（memory_enabled=False）；
-         - 流式生成；结束（且有完整回答）后落库本轮对话；
-      4. 若数据库不可用，回退到 P1 内存记忆路径（不持久化），保证开发期无 DB 也能对话；
+         - P4：执行知识库检索并下发 {"type":"retrieval",...} 帧，把资料注入 Prompt；
+         - 流式生成；结束（且有完整回答）后：
+             · 解析引用标注并下发 {"type":"citations",...} 帧（功能2）；
+             · 落库本轮对话（含引用关系）；
+      4. 若数据库不可用，回退到 P1 内存记忆路径（不持久化、不检索），保证开发期无 DB 也能对话；
       5. 统一的截断提示与结束哨兵。
     """
     # 1) 心跳帧：让前端尽快收到首字节（配合 X-Accel-Buffering: no 生效）
@@ -165,7 +191,14 @@ async def _event_generator(
                 db, conv.id, cfg.MEMORY_MAX_TURNS, cfg.CONTEXT_TOKEN_BUDGET
             )
 
-            # 流式生成：历史来自 DB，关闭内存记忆（memory_enabled=False），避免双写
+            # P4-A1 / P4-B1：知识库检索（向量召回 → 重排 → 上下文）。
+            # retrieve_for_chat 内部吞掉全部异常并给出 mode，保证检索失败也能正常对话；
+            # 结果同时下发给前端，用于渲染「命中 N 段资料 / 未命中 / 未启用」状态。
+            retrieval = await retrieve_for_chat(message, db)
+            yield sse_json(retrieval.meta_payload())
+
+            # 流式生成：历史来自 DB，关闭内存记忆（memory_enabled=False），避免双写；
+            # context 非 None 即走检索增强链（无命中时为空串，由 Prompt 引导模型如实说明）。
             answer_parts: List[str] = []
             try:
                 async for chunk in stream_answer(
@@ -174,6 +207,7 @@ async def _event_generator(
                     history=db_history,
                     meta=meta,
                     memory_enabled=False,
+                    context=retrieval.context,
                 ):
                     answer_parts.append(chunk)
                     yield sse_content(chunk)
@@ -191,9 +225,36 @@ async def _event_generator(
 
             # 正常收尾：有完整回答才落库（避免把空回答/报错写入历史）
             full_answer = "".join(answer_parts)
+
+            # P4-B2：生成本轮引用来源（只保留回答实际标注过的资料；未标注时回退为全部检索资料）。
+            # 必须放在「回答生成之后」——只有拿到完整回答，才能解析出 [n] 标注做来源映射。
+            # 回答为空（生成失败 / 客户端中断）时不下发引用：
+            # 否则会把「一段资料」附在一句「[回答失败]」下面，看起来像是该失败回答的来源。
+            citations = select_citations(retrieval.chunks, full_answer) if full_answer else []
+            if citations:
+                # 引用帧：前端用它渲染「回答下方」的引用卡片（P4-F2）。
+                # 放在 [DONE] 之前、正文之后，不打断流式渲染。
+                yield sse_json({"type": "citations", "items": citations})
+
             if full_answer:
                 try:
-                    await svc.append_turn(db, conv.id, message, full_answer)
+                    saved = await svc.append_turn(
+                        db, conv.id, message, full_answer, citations=citations
+                    )
+                    # P6-B2：把落库后的真实消息 ID 回传前端。
+                    # 前端流式气泡用的是本地临时 ID，无法用于 /messages/{id}/feedback；
+                    # 只有拿到数据库主键，点赞/点踩按钮才有可指向的目标。
+                    # 放在 [DONE] 之前下发，且失败不影响主流程（见下方 except）。
+                    # 注：对返回值的类型做防御性判断——单测里 append_turn 常被替换为
+                    # 返回 None 的桩函数，硬解包会抛 TypeError 并污染「落库成功」的语义。
+                    if isinstance(saved, tuple) and len(saved) == 2:
+                        yield sse_json(
+                            {
+                                "type": "message",
+                                "id": str(saved[1]),          # 助手消息 ID（反馈目标）
+                                "user_message_id": str(saved[0]),  # 用户消息 ID（便于排查）
+                            }
+                        )
                 except Exception as exc:  # noqa: BLE001 ——落库失败仅记录，不影响已下发的流
                     logger.error("落库本轮对话失败：%s", exc)
 
@@ -219,6 +280,10 @@ async def _event_generator(
     # 4) 回退：P1 内存记忆路径（不持久化）——与 P1 行为一致，便于无 DB 环境联调
     meta = {}
     answer_parts = []
+    # P4：无数据库时无法查询向量表，这里仍下发一帧「检索未启用」，
+    # 使前端对 retrieval 帧的处理逻辑保持单一（有帧即渲染状态，不区分链路）。
+    fallback_retrieval = await retrieve_for_chat(message, None)
+    yield sse_json(fallback_retrieval.meta_payload())
     try:
         async for chunk in stream_answer(
             message,

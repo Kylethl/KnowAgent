@@ -165,11 +165,13 @@ async def append_turn(
     conversation_id: UUID,
     user_content: str,
     assistant_content: str,
-) -> None:
+    citations: Optional[List[Dict]] = None,
+) -> tuple:
     """把一轮「用户提问 + 助手回答」写入消息表，并更新会话元数据。
 
     副作用：
       - 新增两条消息（role=user / role=assistant），各记 token_count（窗口管理用）；
+      - P4-B2：助手消息额外写入 citations（引用来源），历史回看时据此还原引用卡片；
       - 若该会话尚无标题，用首条用户问题前若干字回填 title；
       - 刷新 conversation.updated_at，使左侧列表按「最近活跃」置顶。
 
@@ -178,24 +180,40 @@ async def append_turn(
         conversation_id: 会话 ID。
         user_content: 本轮用户提问文本。
         assistant_content: 本轮助手完整回答文本。
+        citations: 本轮回答的引用来源列表（doc_id + 片段等），无引用时传 None。
+
+    Returns:
+        (user_message_id, assistant_message_id) 二元组。
+
+    P6 为什么需要返回 ID：
+        反馈接口 /messages/{id}/feedback 需要一个「真实的消息主键」。
+        前端在流式过程中用的是自己生成的消息 ID（src/hooks/useChatStream.ts），
+        与数据库主键无关；因此后端落库后必须把生成的 ID 回传给前端，
+        否则点赞/点踩按钮没有可以指向的目标。
     """
     # 1) 写入两条消息（token_count 用于后续上下文窗口预算）
-    db.add(
-        Message(
-            conversation_id=conversation_id,
-            role="user",
-            content=user_content,
-            token_count=estimate_tokens(user_content),
-        )
+    user_message = Message(
+        conversation_id=conversation_id,
+        role="user",
+        content=user_content,
+        token_count=estimate_tokens(user_content),
     )
-    db.add(
-        Message(
-            conversation_id=conversation_id,
-            role="assistant",
-            content=assistant_content,
-            token_count=estimate_tokens(assistant_content),
-        )
+    assistant_message = Message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=assistant_content,
+        token_count=estimate_tokens(assistant_content),
+        # 引用关系随消息一起落库（JSONB 列）：这是《需求清单》P4 功能2
+        # 「引用关系存 messages 附加字段」的落地方式。
+        # 存 None 而非空列表：便于区分「当时未启用检索」与「检索了但无引用」。
+        citations=citations or None,
     )
+    db.add(user_message)
+    db.add(assistant_message)
+
+    # 1.1) flush 拿到数据库生成的主键（UUID 由 PG 的 gen_random_uuid() 产生，
+    #      不 flush 就取不到，也就无法回传给前端做反馈）
+    await db.flush()
 
     # 2) 取回会话对象，做标题回填与时间刷新
     result = await db.execute(
@@ -217,6 +235,9 @@ async def append_turn(
         len(user_content),
         len(assistant_content),
     )
+
+    # 4) 回传两条消息的主键：调用方（/chat）据此下发 message 帧，供前端绑定反馈按钮
+    return user_message.id, assistant_message.id
 
 
 async def load_history_window(

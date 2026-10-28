@@ -29,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -42,16 +42,13 @@ from ..core.logging import get_logger
 from ..db.engine import SessionLocal
 from ..db.models import Document, DocumentChunk
 from ..services import embedding as embedding_mod
+from ..services import media_extract, media_types, retrieval_cache
 from ..services.chunker import Chunk, chunk_blocks
-from ..services.parser import DocumentParseError, parse_document
+from ..services.media_extract import MediaExtractError
+from ..services.parser import DocumentParseError, parse_document, parse_extracted_text
 from ..services.storage import StorageError, build_storage
 
 logger = get_logger(__name__)
-
-# 「入库中」僵死判定阈值（分钟）：
-# 若文档停留在 indexing 超过该时长仍未完成，说明上次入库因进程重启/异常中断，
-# 此时允许重新入库，避免文档被永久卡死在 indexing 状态。
-INDEXING_STALE_MINUTES = 10
 
 # 单篇文档的最大切片数（防御性上限）：
 # 防止超大文档产生海量切片拖垮 embedding 费用与写入耗时。
@@ -100,6 +97,70 @@ async def _load_document(db: AsyncSession, document_id) -> Document:
     return doc
 
 
+def stale_minutes_for(doc: Document) -> int:
+    """取该文档适用的「入库僵死」判定阈值（分钟）。
+
+    为什么按类型区分：文本解析 + 向量化通常秒级到分钟级，10 分钟足够；
+    而图片 OCR / 音视频 ASR 走外部大模型，一段长视频转写可能几十分钟，
+    用同一阈值会把「仍在正常跑」的任务误判为僵死，导致并发重跑与重复计费。
+
+    Args:
+        doc: 文档对象。
+
+    Returns:
+        阈值分钟数（正整数）。
+    """
+    settings = get_settings()
+    if media_types.is_media_type(doc.file_type):
+        return max(int(settings.MEDIA_INDEXING_STALE_MINUTES), 1)
+    return max(int(settings.INDEXING_STALE_MINUTES), 1)
+
+
+def indexing_elapsed_seconds(doc: Document) -> Optional[int]:
+    """文档停留在 indexing 状态的时长（秒）；非 indexing 状态返回 None。
+
+    以 updated_at 近似入库开始时间：置为 indexing 时就会写一次 updated_at，
+    入库过程中不再改动该行，因此可作为「本次任务已跑了多久」的估算。
+
+    Args:
+        doc: 文档对象。
+
+    Returns:
+        已持续秒数（>=0）；状态不是 indexing 时为 None。
+    """
+    if doc.status != "indexing":
+        return None
+    if doc.updated_at is None:
+        # 缺少时间戳：无法估算，返回 0 让上层按「时长未知」处理
+        return 0
+    updated = doc.updated_at
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return max(int((datetime.now(timezone.utc) - updated).total_seconds()), 0)
+
+
+def is_indexing_stale(doc: Document) -> bool:
+    """判断「入库中」是否已僵死（上次任务被中断，不会再自行完成）。
+
+    判定依据：status='indexing' 且已持续超过该文档类型的阈值。
+    这是「文档永久卡在入库中」的唯一出口——前端据此放开「重新入库」按钮，
+    后端据此放行重跑（见 assert_can_index）。
+
+    Args:
+        doc: 文档对象。
+
+    Returns:
+        True 表示僵死可重跑；False 表示未在入库中，或确实仍在正常入库。
+    """
+    elapsed = indexing_elapsed_seconds(doc)
+    if elapsed is None:
+        return False
+    # updated_at 缺失时按「无法证明在跑」处理：宁可允许重跑，也不要永久卡死
+    if doc.updated_at is None:
+        return True
+    return elapsed > stale_minutes_for(doc) * 60
+
+
 def assert_can_index(doc: Document) -> None:
     """校验文档当前状态是否允许入库（供 API 层做前置校验复用）。
 
@@ -115,17 +176,10 @@ def assert_can_index(doc: Document) -> None:
         IndexingInProgress: 确实正在入库中。
     """
     if doc.status == "indexing":
-        # 判断是否为僵死任务：updated_at 距今超过阈值则视为可重跑
-        updated = doc.updated_at
-        if updated is None:
-            # 没有更新时间戳时保守处理：视为僵死，允许重跑（避免永久卡死）
-            return
-        if updated.tzinfo is None:
-            updated = updated.replace(tzinfo=timezone.utc)
-        if datetime.now(timezone.utc) - updated > timedelta(minutes=INDEXING_STALE_MINUTES):
+        if is_indexing_stale(doc):
             logger.warning(
-                "文档 %s 停留在 indexing 超过 %d 分钟，判定为僵死任务，允许重新入库",
-                doc.id, INDEXING_STALE_MINUTES,
+                "文档 %s 停留在 indexing 已 %s 秒（阈值 %d 分钟），判定为僵死任务，允许重新入库",
+                doc.id, indexing_elapsed_seconds(doc), stale_minutes_for(doc),
             )
             return
         raise IndexingInProgress()
@@ -135,6 +189,46 @@ def assert_can_index(doc: Document) -> None:
         raise IndexingNotAllowed(
             f"文档尚未审核通过（当前审核结论：{doc.review_status}），不能入库"
         )
+
+
+async def _mark_indexing(db: AsyncSession, doc: Document) -> bool:
+    """把文档原子地置为 'indexing'，用于抢占「本次入库」的执行权。
+
+    为什么不能用 `doc.status = "indexing"; commit()`：
+      那是 check-then-act —— 两个并发请求（如管理员连点两下、或审核通过自动触发
+      与手动重入库撞在一起）都可能通过 assert_can_index，然后各自跑一遍管线，
+      重复计费并互相覆盖切片。这里改成带条件的单条 UPDATE，由数据库行锁仲裁：
+      只有一个请求能让 rowcount=1。
+
+    条件里保留「已僵死的 indexing 也允许抢占」：僵死文档必须能被重新入库。
+
+    Args:
+        db: 异步数据库会话。
+        doc: 已通过 assert_can_index 的文档对象。
+
+    Returns:
+        True 表示抢占成功（本次调用负责跑管线）；False 表示已被其他任务占住。
+    """
+    # 僵死阈值对应的「最后活跃时间」分界线：早于它仍停在 indexing 即视为僵死
+    deadline = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes_for(doc))
+    stmt = (
+        update(Document)
+        .where(
+            Document.id == doc.id,
+            Document.deleted_at.is_(None),
+            or_(
+                # 正常情况：不在入库中，可直接抢占
+                Document.status != "indexing",
+                # 僵死情况：仍在 indexing，但最后活跃时间已超过阈值
+                Document.updated_at < deadline,
+                # updated_at 缺失（历史数据）：无法证明在跑，允许抢占
+                Document.updated_at.is_(None),
+            ),
+        )
+        .values(status="indexing", last_index_error=None)
+    )
+    result = await db.execute(stmt)
+    return (result.rowcount or 0) == 1
 
 
 async def _replace_chunks(
@@ -204,15 +298,40 @@ async def index_document(document_id) -> int:
         doc = await _load_document(db, document_id)
         assert_can_index(doc)
 
-        # ② 标记为入库中（先落盘，便于前端展示「入库中」）
-        doc.status = "indexing"
-        doc.last_index_error = None
+        # ② 原子抢占并标记为入库中（先落盘，便于前端展示「入库中」）
+        #    用条件 UPDATE 而不是直接改 ORM 属性：避免并发请求各跑一遍管线。
+        if not await _mark_indexing(db, doc):
+            raise IndexingInProgress("该文档已有入库任务在执行，请稍后再试")
         await db.commit()
+        # UPDATE 走的是 SQL 表达式，ORM 对象里的旧值不会自动同步，刷新后再继续使用
+        await db.refresh(doc)
 
         try:
-            # ③ 读原始文件 → 解析 → 切片
-            content = await storage.get_object(doc.original_path)
-            blocks = parse_document(content, doc.file_type)
+            # ③ 解析：文档类直接解析原文件；图片/音视频先经 OCR/ASR 提取文本（P5 功能2）
+            #    两类走不同路径但殊途同归——都产出 ParsedBlock，后续切片与向量化完全复用。
+            extraction_text: Optional[str] = None
+            extraction_meta: Optional[dict] = None
+            if media_types.is_media_type(doc.file_type):
+                # 媒体文件可能上百 MB：流式落到临时文件再处理，避免整段读进内存
+                tmp_path = await media_extract.save_object_to_temp(
+                    storage, doc.original_path
+                )
+                try:
+                    extraction = await media_extract.extract_media(
+                        tmp_path, doc.file_type, doc.filename
+                    )
+                finally:
+                    # 临时文件必须清理：视频转码后的中间文件同样占磁盘
+                    tmp_path.unlink(missing_ok=True)
+                extraction_text = extraction.text
+                extraction_meta = extraction.meta
+                # 章节名按来源形态区分，引用卡片上用户能看出「这段来自图片/音频」
+                heading = "图片文字" if doc.file_type == "image" else "语音转写"
+                blocks = parse_extracted_text(extraction_text, heading=heading)
+            else:
+                content = await storage.get_object(doc.original_path)
+                blocks = parse_document(content, doc.file_type)
+
             chunks = chunk_blocks(blocks, chunk_size=settings.CHUNK_SIZE, overlap=settings.CHUNK_OVERLAP)
 
             if not chunks:
@@ -234,15 +353,26 @@ async def index_document(document_id) -> int:
             doc.chunk_count = written
             doc.indexed_at = datetime.now(timezone.utc)
             doc.last_index_error = None
+            # P4：记录本次入库实际使用的向量模型签名（"mock" 或模型名）。
+            # 之后若配置变化（补了真实 Key / 换模型），接口层比对不一致即提示重新入库，
+            # 避免「mock 向量混在真实检索里」导致答案跑偏。
+            doc.embedding_model = embedding_mod.current_embedding_signature()
+            # P5：把多模态解析结果一并留痕（文档类保持 NULL）
+            # 用途：管理员审核预览、排查「已入库但检索不到」、失败后对比新旧结果
+            doc.extracted_text = extraction_text
+            doc.extract_meta = extraction_meta
             await db.commit()
 
             logger.info(
                 "文档入库成功：id=%s，filename=%s，切片数=%d",
                 doc.id, doc.filename, written,
             )
+            # P4-DB1：知识库内容已变，立即失效检索缓存，
+            # 否则新入库内容最多要等 RAG_CACHE_TTL 秒才能被检索到（同问题仍返回旧召回）
+            await retrieval_cache.get_retrieval_cache().invalidate()
             return written
 
-        except (DocumentParseError, embedding_mod.EmbeddingError, StorageError) as exc:
+        except (DocumentParseError, embedding_mod.EmbeddingError, StorageError, MediaExtractError) as exc:
             # 可预期的管线失败：回滚并把状态恢复为「已审核未入库」，保留错误原因
             await db.rollback()
             doc = await _load_document(db, document_id)
@@ -277,7 +407,9 @@ async def unpublish_document(document_id) -> None:
     """
     async with SessionLocal() as db:
         doc = await _load_document(db, document_id)
-        if doc.status == "indexing":
+        # 僵死任务（上次入库已中断）不再阻拦下线：否则这类文档既不能下线也不能重入库，
+        # 管理员唯一的处置手段会被彻底堵死。
+        if doc.status == "indexing" and not is_indexing_stale(doc):
             raise IndexingInProgress("文档正在入库中，请入库完成后再下线")
 
         # 删除切片：document_chunks 的 FK 为 ON DELETE CASCADE，
@@ -287,9 +419,15 @@ async def unpublish_document(document_id) -> None:
         doc.chunk_count = 0
         doc.indexed_at = None
         doc.last_index_error = None
+        # 向量已随切片一并删除，模型签名一并清空（重新入库时会重新写入）
+        doc.embedding_model = None
         await db.commit()
 
         logger.info("文档已下线：id=%s，filename=%s", doc.id, doc.filename)
+
+        # P4-DB1：下线意味着「不再参与检索」，必须立刻失效缓存，
+        # 否则已下线的文档仍可能被旧缓存召回并出现在回答里
+        await retrieval_cache.get_retrieval_cache().invalidate()
 
 
 def _broker_reachable(broker_url: str, timeout: float = 0.4) -> bool:
@@ -320,11 +458,15 @@ def _broker_reachable(broker_url: str, timeout: float = 0.4) -> bool:
         return False
 
 
-def enqueue_index_document(document_id) -> bool:
+def enqueue_index_document(document_id, file_type: str = "word") -> bool:
     """把入库任务投递到 Celery；不可用时返回 False 由调用方回退。
+
+    P5 起按文件类型分流到不同队列：图片/音视频的 OCR/ASR 耗时且吃算力，
+    走独立的 media 队列（可由独立 worker 消费），避免把普通文档入库排在长视频后面。
 
     Args:
         document_id: 文档 ID。
+        file_type: 文档类型（word / markdown / image / audio / video），决定投递队列。
 
     Returns:
         True 表示已成功投递到 Celery（由 worker 异步执行）；
@@ -345,8 +487,16 @@ def enqueue_index_document(document_id) -> bool:
         # 懒导入：celery 未安装或无 broker 时不影响主流程
         from ..tasks.indexing_tasks import index_document_task
 
-        index_document_task.delay(str(document_id))
-        logger.info("已投递入库任务到 Celery：document_id=%s", document_id)
+        # 媒体类走独立队列；未配置队列名（空串）时退回默认队列
+        queue = settings.CELERY_MEDIA_QUEUE if media_types.is_media_type(file_type) else ""
+        if queue:
+            index_document_task.apply_async(args=[str(document_id)], queue=queue)
+        else:
+            index_document_task.delay(str(document_id))
+        logger.info(
+            "已投递入库任务到 Celery：document_id=%s，type=%s，queue=%s",
+            document_id, file_type, queue or "default",
+        )
         return True
     except Exception as exc:  # noqa: BLE001 —— 投递失败不影响主流程，回退即可
         logger.warning("投递 Celery 任务失败，回退为进程内执行：%s", exc)

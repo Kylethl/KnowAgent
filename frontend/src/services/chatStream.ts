@@ -1,4 +1,4 @@
-import type { ChatMessage } from '../types';
+import type { ChatMessage, Citation, RetrievalInfo } from '../types';
 import { getToken } from './http';
 
 // P1-F2：SSE 流式对话服务
@@ -10,6 +10,19 @@ import { getToken } from './http';
 //      因此令牌只能作为 query 参数 ?token=xxx 传递（后端 get_current_user_id_sse
 //      已兼容：优先取 Authorization 头，缺失时回退 query 的 token）。
 //      该方案的安全权衡详见后端 core/security.py 的注释（依赖 HTTPS + 短时效令牌）。
+//
+// P4-F1：新增 retrieval 帧解析 —— 后端在正文之前下发
+//      {"type":"retrieval","mode":"rag","count":3,...}，表示本轮回答的知识库检索状态；
+//      前端据此在助手气泡下方渲染「命中 N 段资料 / 未命中 / 未启用」。
+//
+// P4-F2：新增 citations 帧解析 —— 后端在正文之后、[DONE] 之前下发
+//      {"type":"citations","items":[{index,doc_id,doc_title,chunk_id,snippet,...}]}，
+//      前端据此在回答下方渲染引用卡片（标题 / 片段 / 可点击查看原文）。
+//
+// P6-F2：新增 message 帧解析 —— 后端在落库之后、[DONE] 之前下发
+//      {"type":"message","id":"<助手消息ID>","user_message_id":"<用户消息ID>"}。
+//      流式气泡用的是前端临时 ID，而反馈接口需要数据库主键，
+//      没有这一帧就无法提交点赞/点踩（反馈按钮会一直不出现）。
 
 // 后端约定的流结束哨兵（收到即认为本轮回答结束）
 export const DONE_SIGNAL = '[DONE]';
@@ -26,6 +39,13 @@ export interface ChatStreamHandlers {
   // P2-F1：服务端在流起始下发 {type:"conversation",id} 帧，
   //       用于「首次发送自动建会话」时把新会话 ID 回绑给前端（绑定左侧列表）。
   onConversation?: (id: string) => void;
+  // P4-F1：服务端下发 {type:"retrieval",...} 帧，回传本轮知识库检索状态
+  onRetrieval?: (info: RetrievalInfo) => void;
+  // P4-F2：服务端下发 {type:"citations",...} 帧，回传本轮引用来源
+  onCitations?: (items: Citation[]) => void;
+  // P6-F2：服务端在落库后下发 {type:"message",id} 帧，回传**真实消息 ID**。
+  //       前端据此把临时气泡 ID 换成数据库主键，点赞/点踩才有提交目标。
+  onMessage?: (info: { id: string; userMessageId?: string }) => void;
 }
 
 /**
@@ -76,6 +96,31 @@ export function startChatStream(
       return;
     }
 
+    // P4-F1：检索状态帧 —— {"type":"retrieval","mode":"rag","count":3,...}
+    // 该帧在正文分片之前到达，只解析一次，交由上层挂到本轮助手消息上。
+    const retrieval = tryParseRetrieval(raw);
+    if (retrieval) {
+      handlers.onRetrieval?.(retrieval);
+      return;
+    }
+
+    // P4-F2：引用来源帧 —— {"type":"citations","items":[...]}
+    // 该帧在正文之后、[DONE] 之前到达；解析为空数组时也视为有效帧，
+    // 避免空 JSON 被当作正文拼进回答。
+    const citations = tryParseCitations(raw);
+    if (citations) {
+      handlers.onCitations?.(citations);
+      return;
+    }
+
+    // P6-F2：消息回执帧 —— {"type":"message","id":"uuid","user_message_id":"uuid"}
+    // 在落库之后、[DONE] 之前到达；拿到它之后才允许显示反馈按钮。
+    const messageId = tryParseMessage(raw);
+    if (messageId) {
+      handlers.onMessage?.(messageId);
+      return;
+    }
+
     // 兼容两种数据格式：JSON（{"content":"..."}）与纯文本分片
     const text = extractContent(raw);
     if (text) {
@@ -112,10 +157,120 @@ function tryParseConversation(raw: string): string | null {
 }
 
 /**
+ * 尝试从 SSE data 帧中解析「知识库检索状态」。
+ * 形如 {"type":"retrieval","mode":"rag","count":3} 时返回规范化对象，否则返回 null。
+ *
+ * 容错约定（后端字段可能因版本演进增减，前端不应因此崩溃）：
+ * - mode 不在四种已知取值内 → 视为 undefined 的下发，直接忽略该帧；
+ * - count 缺失或非法 → 退化为 0（「已检索但未命中」的展示仍然正确）。
+ */
+function tryParseRetrieval(raw: string): RetrievalInfo | null {
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw) as { type?: unknown; [key: string]: unknown };
+    if (parsed.type !== 'retrieval') return null;
+
+    // 只接受后端约定的四种 mode，防止脏数据让界面出现未知状态
+    const mode = parsed.mode;
+    if (mode !== 'rag' && mode !== 'no_hit' && mode !== 'disabled' && mode !== 'fallback') {
+      return null;
+    }
+
+    return {
+      mode,
+      // count 非法时按 0 处理（Number 转换失败会得到 NaN，需显式兜底）
+      count: typeof parsed.count === 'number' && Number.isFinite(parsed.count) ? parsed.count : 0,
+      cached: typeof parsed.cached === 'boolean' ? parsed.cached : undefined,
+      elapsed_ms: typeof parsed.elapsed_ms === 'number' ? parsed.elapsed_ms : undefined,
+      reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+    };
+  } catch {
+    // 非该类型帧，交由 extractContent 处理
+  }
+  return null;
+}
+
+/**
+ * 尝试从 SSE data 帧中解析「答案引用来源」。
+ * 形如 {"type":"citations","items":[Citation,...]} 时返回规范化列表，否则返回 null。
+ *
+ * 返回值契约：解析成功时**一定返回数组**（可能为空），因此上层用 `if (result)`
+ * 判断即可——空数组也是有效帧，不能被误当成正文。
+ *
+ * 逐条容错：缺少 chunk_id / doc_id 的条目无法跳转，直接丢弃；
+ * snippet 缺失时退化为空串（卡片仍可展示标题与序号）。
+ */
+function tryParseCitations(raw: string): Citation[] | null {
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw) as { type?: unknown; items?: unknown };
+    if (parsed.type !== 'citations') return null;
+    if (!Array.isArray(parsed.items)) return [];
+
+    const items: Citation[] = [];
+    for (const raw of parsed.items) {
+      if (!raw || typeof raw !== 'object') continue;
+      const item = raw as Record<string, unknown>;
+      // 跳转必需的字段：文档 ID 与切片 ID（缺任一个卡片就点不开）
+      if (typeof item.doc_id !== 'string' || typeof item.chunk_id !== 'string') continue;
+      items.push({
+        index: typeof item.index === 'number' ? item.index : items.length + 1,
+        doc_id: item.doc_id,
+        doc_title: typeof item.doc_title === 'string' ? item.doc_title : '未命名文档',
+        file_type: typeof item.file_type === 'string' ? item.file_type : '',
+        chunk_id: item.chunk_id,
+        chunk_index: typeof item.chunk_index === 'number' ? item.chunk_index : 0,
+        heading: typeof item.heading === 'string' ? item.heading : '',
+        snippet: typeof item.snippet === 'string' ? item.snippet : '',
+        score: typeof item.score === 'number' ? item.score : 0,
+        vector_score: typeof item.vector_score === 'number' ? item.vector_score : 0,
+        cited: item.cited === true,
+      });
+    }
+    return items;
+  } catch {
+    // 非该类型帧，交由 extractContent 处理
+  }
+  return null;
+}
+
+/**
+ * 尝试从 SSE data 帧中解析「消息回执」（P6-F2）。
+ * 形如 {"type":"message","id":"uuid","user_message_id":"uuid"} 时返回对象，否则返回 null。
+ *
+ * 容错：缺少 id 的帧直接忽略——没有主键的回执毫无用处，
+ * 若把它当成有效帧，上层会拿到空 ID 并渲染出点了必然 404 的反馈按钮。
+ */
+function tryParseMessage(raw: string): { id: string; userMessageId?: string } | null {
+  if (!raw.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(raw) as {
+      type?: unknown;
+      id?: unknown;
+      user_message_id?: unknown;
+    };
+    if (parsed.type !== 'message') return null;
+    if (typeof parsed.id !== 'string' || parsed.id === '') return null;
+
+    return {
+      id: parsed.id,
+      userMessageId: typeof parsed.user_message_id === 'string' ? parsed.user_message_id : undefined,
+    };
+  } catch {
+    // 非该类型帧，交由 extractContent 处理
+  }
+  return null;
+}
+
+/**
  * 从 SSE data 帧中提取文本内容
  * - 若形如 JSON（以 { 开头）则取 content 字段
  * - 否则按纯文本分片处理
  * 这样可同时兼容后端的不同下发格式。
+ *
+ * 重要：能解析成 JSON 但没有 content 字段的帧一律返回空串。
+ * 否则（旧实现）会把整段 JSON 原样当成正文拼进气泡——
+ * 一旦后端新增帧类型而前端尚未适配，用户就会在回答里看到一段原始 JSON。
  */
 function extractContent(raw: string): string {
   if (raw.startsWith('{')) {
@@ -124,6 +279,9 @@ function extractContent(raw: string): string {
       if (typeof parsed.content === 'string') {
         return parsed.content;
       }
+      // 合法 JSON 但没有 content：说明是某种控制帧（conversation/retrieval/citations/message…），
+      // 上层已各自处理过；此处返回空串，绝不能把 JSON 原文当正文
+      return '';
     } catch {
       // JSON 解析失败时回退为纯文本
       return raw;

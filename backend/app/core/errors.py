@@ -185,3 +185,50 @@ class IndexingInProgress(Exception):
     def __init__(self, message: str = "该文档正在入库中，请稍后再试"):
         super().__init__(message)
         self.message = message
+
+
+# =====================================================================
+# 运营闭环异常（P6：审核通知 + 答案反馈）
+# ---------------------------------------------------------------------
+# 沿用同一约定：找不到 → 404（不区分「不存在」与「不属于你」），
+# 状态/入参不允许 → 400 或 409。
+# =====================================================================
+
+
+class NotificationNotFound(Exception):
+    """通知不存在、已被清理，或不属于当前用户。
+
+    统一用「找不到」语义，避免区分「不存在」与「不是你的」而泄露信息。
+    上层（api/notifications.py）据此返回 404。
+    """
+
+    def __init__(self, notification_id=None):
+        super().__init__(f"通知不存在或无权访问：{notification_id}")
+        self.message = str(self)
+
+
+class MessageNotFound(Exception):
+    """消息不存在、已被删除，或不属于当前用户的会话。
+
+    反馈接口必须按「回答属于谁」鉴权：知识库共享，但对话是私有的，
+    任何人都不能给别人的回答打分。上层据此返回 404。
+    """
+
+    def __init__(self, message_id=None):
+        super().__init__(f"消息不存在或无权访问：{message_id}")
+        self.message = str(self)
+
+
+class FeedbackNotAllowed(Exception):
+    """当前消息不允许被评价（例如对用户自己的提问点赞）。
+
+    《需求清单》P6 功能2 的评价对象是「答案」，因此只允许评价 role='assistant'
+    的消息；对 user / system 消息提交反馈属于非法调用。上层据此返回 409。
+
+    说明：反馈内容超长（comment 超过上限）同样走本异常——都是
+    「入参不被接受」，前端只需展示 message 即可，无需细分错误码。
+    """
+
+    def __init__(self, message: str = "该消息不支持评价"):
+        super().__init__(message)
+        self.message = message

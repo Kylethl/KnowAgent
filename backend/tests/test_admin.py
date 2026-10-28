@@ -9,7 +9,7 @@
 #   3. 预览：markdown 直接解、word 提取文本、超长截断；
 #   4. RBAC：无令牌 401、非管理员 403、管理员 200。
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.admin as admin_module
-from app.core.errors import DocumentNotFound, ReviewNotAllowed
+from app.core.errors import DocumentNotFound, IndexingInProgress, ReviewNotAllowed
 from app.db.models import Document, User
 from app.main import create_app
 from app.services import review_service
@@ -250,11 +250,26 @@ async def test_preview_truncates_long_text():
 
 
 @pytest.mark.asyncio
-async def test_preview_unsupported_type_returns_hint():
-    """暂不支持的类型应返回可读提示，而不是抛错中断审核。"""
+async def test_preview_media_before_extraction_returns_hint():
+    """媒体未解析时应返回可读提示，而不是抛错中断审核（P5 语义变更）。
+
+    P5 起图片/音视频不再显示「暂不支持」：它们会在入库阶段经 OCR/ASR 产出文本，
+    解析前预览给出「尚未解析」的说明，管理员仍可通过播放/查看原文件判断。
+    """
     doc = _make_document(file_type="video")
     text, _ = await review_service.preview_document(FakeStorage(b"x"), doc)
-    assert "暂不支持" in text
+    assert "OCR/ASR" in text
+
+
+@pytest.mark.asyncio
+async def test_preview_media_returns_extracted_text():
+    """已解析的媒体：预览直接返回 extracted_text（不再回读原始文件）。"""
+    doc = _make_document(file_type="audio")
+    doc.extracted_text = "会议纪要：本次讨论了三季度目标。"
+    # FakeStorage 传入的字节与结果无关：媒体预览不应读原文件
+    text, truncated = await review_service.preview_document(FakeStorage(b""), doc)
+    assert text.startswith("会议纪要")
+    assert truncated is False
 
 
 # ---------------------------------------------------------------------
@@ -374,3 +389,174 @@ def test_admin_preview_not_found_returns_404(admin_client, monkeypatch):
     monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
     resp = client.get(f"/admin/documents/{uuid4()}/preview")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------
+# 入库触发：POST /admin/documents/{id}/index（P5 修复补充）
+# ---------------------------------------------------------------------
+# 为什么补这一组：
+#   此前 21 个管理员用例覆盖了 review / preview，却**没有一条**打到「重新入库」端点。
+#   线上因此出了事故：文档卡在 indexing 时按钮被禁用，而这条链路上
+#   「僵死放行」的分支既没被前端用到、也没被接口层测过，两侧同时失守。
+# 覆盖重点：200（投递成功）/ 409（未审核、真在跑）/ 200（僵死放行，核心回归）/ 404。
+
+
+def _stale_indexing_doc(minutes: float = 950):
+    """构造「停留在入库中且已超时」的文档。
+
+    对应线上现场：u_4ff45c 的《部署手册.md》status='indexing' 已持续约 16 小时。
+    """
+    doc = _make_document(review_status="approved", status="indexing")
+    doc.updated_at = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return doc
+
+
+def test_admin_index_dispatches_task(admin_client, monkeypatch):
+    """已入库文档重新入库：应投递任务并返回 queued=True。"""
+    client, _ = admin_client
+    doc = _make_document(review_status="approved", status="indexed")
+    dispatched = {}
+
+    async def fake_get(db, document_id):
+        return doc
+
+    def fake_dispatch(document_id, file_type="word"):
+        dispatched["args"] = (str(document_id), file_type)
+        return True
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    monkeypatch.setattr(admin_module, "_dispatch_indexing", fake_dispatch)
+
+    resp = client.post(f"/admin/documents/{doc.id}/index")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["queued"] is True
+    # 必须把文档类型一并传给调度器：媒体类要投递到独立的 media 队列
+    assert dispatched["args"] == (str(doc.id), "markdown")
+
+
+def test_admin_index_rejects_unreviewed_409(admin_client, monkeypatch):
+    """未审核通过：409，且 detail 可读（前端直接展示）。"""
+    client, _ = admin_client
+    doc = _make_document(review_status="pending", status="pending")
+
+    async def fake_get(db, document_id):
+        return doc
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    resp = client.post(f"/admin/documents/{doc.id}/index")
+    assert resp.status_code == 409
+    assert "审核" in resp.json()["detail"]
+
+
+def test_admin_index_rejects_running_409(admin_client, monkeypatch):
+    """确实在入库中（updated_at 刚刚）：409，避免并发重跑与重复计费。"""
+    client, _ = admin_client
+    doc = _stale_indexing_doc(minutes=1)
+
+    async def fake_get(db, document_id):
+        return doc
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    resp = client.post(f"/admin/documents/{doc.id}/index")
+    assert resp.status_code == 409
+    assert "入库中" in resp.json()["detail"]
+
+
+def test_admin_index_allows_stale_indexing(admin_client, monkeypatch):
+    """★ 核心回归：入库已僵死必须放行（否则文档永久卡住、只能改库）。
+
+    修复前该场景返回 409，配合前端按钮禁用，等于彻底断掉恢复路径。
+    """
+    client, _ = admin_client
+    doc = _stale_indexing_doc()
+    called = {"n": 0}
+
+    async def fake_get(db, document_id):
+        return doc
+
+    def fake_dispatch(document_id, file_type="word"):
+        called["n"] += 1
+        return False  # 模拟 Celery 不可用、回退进程内执行
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    monkeypatch.setattr(admin_module, "_dispatch_indexing", fake_dispatch)
+
+    resp = client.post(f"/admin/documents/{doc.id}/index")
+    assert resp.status_code == 200
+    assert resp.json()["queued"] is False
+    assert called["n"] == 1
+
+
+def test_admin_index_not_found_returns_404(admin_client, monkeypatch):
+    """文档不存在 / 已删除：404。"""
+    client, _ = admin_client
+
+    async def fake_get(db, document_id):
+        raise DocumentNotFound(document_id)
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    resp = client.post(f"/admin/documents/{uuid4()}/index")
+    assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------
+# 下线：POST /admin/documents/{id}/unpublish
+# ---------------------------------------------------------------------
+
+
+def test_admin_unpublish_ok(admin_client, monkeypatch):
+    """正常下线：同步执行，返回 queued=False 与提示文案。"""
+    client, _ = admin_client
+    doc = _make_document(review_status="approved", status="indexed")
+    seen = {}
+
+    async def fake_get(db, document_id):
+        return doc
+
+    async def fake_unpublish(document_id):
+        seen["id"] = str(document_id)
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    monkeypatch.setattr(admin_module.indexing_service, "unpublish_document", fake_unpublish)
+
+    resp = client.post(f"/admin/documents/{doc.id}/unpublish")
+    assert resp.status_code == 200
+    assert resp.json()["queued"] is False
+    assert seen["id"] == str(doc.id)
+
+
+def test_admin_unpublish_stale_indexing_ok(admin_client, monkeypatch):
+    """★ 回归：僵死文档也必须能下线（否则「重入库」与「下线」被同一状态同时堵死）。"""
+    client, _ = admin_client
+    doc = _stale_indexing_doc()
+
+    async def fake_get(db, document_id):
+        return doc
+
+    async def fake_unpublish(document_id):
+        return None
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    monkeypatch.setattr(admin_module.indexing_service, "unpublish_document", fake_unpublish)
+
+    resp = client.post(f"/admin/documents/{doc.id}/unpublish")
+    assert resp.status_code == 200
+
+
+def test_admin_unpublish_running_409(admin_client, monkeypatch):
+    """确实在入库中时下线应 409（由服务层状态机拒绝）。"""
+    client, _ = admin_client
+
+    async def fake_get(db, document_id):
+        return _make_document(review_status="approved", status="indexing")
+
+    async def fake_unpublish(document_id):
+        raise IndexingInProgress("文档正在入库中，请入库完成后再下线")
+
+    monkeypatch.setattr(admin_module.review_service, "get_document_for_review", fake_get)
+    monkeypatch.setattr(admin_module.indexing_service, "unpublish_document", fake_unpublish)
+
+    resp = client.post(f"/admin/documents/{uuid4()}/unpublish")
+    assert resp.status_code == 409
+    assert "入库中" in resp.json()["detail"]

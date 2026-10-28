@@ -17,8 +17,10 @@
 # 注意：本文件不引入 /api 前缀，由 nginx/Vite 代理统一剥离前缀后转发（同 /chat）。
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List
 from uuid import UUID
 
 from ..core.errors import ConversationNotFound
@@ -27,18 +29,49 @@ from ..core.security import get_current_user_id
 from ..db.engine import get_db
 from ..db.models import Message
 from ..schemas import (
+    CitationOut,
     ConversationCreate,
     ConversationDetail,
     ConversationMessageOut,
     ConversationOut,
     ConversationSummary,
+    FeedbackOut,
 )
 from ..services import conversation_service as svc
+from ..services import feedback_service
 
 logger = get_logger(__name__)
 
 # 路由集合；main.py 中以 /conversations 前缀相关路径统一注册
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+
+def _parse_citations(raw) -> List[CitationOut]:
+    """把 messages.citations（JSONB）安全地转换为 CitationOut 列表。
+
+    为什么要做转换而不是直接透传：
+      - citations 是历史数据，可能来自旧版本（字段缺失、结构变化），
+        直接塞进响应模型会在序列化阶段抛校验错误，把「回看历史」整个接口打挂；
+      - 逐条校验 + 跳过非法项，宁可少展示一条引用，也不能让历史页面打不开。
+
+    Args:
+        raw: 数据库中的 citations 值（通常是 list[dict]，旧数据可能为 None 或其他类型）。
+
+    Returns:
+        合法的引用列表；任何异常情形都返回空列表。
+    """
+    if not isinstance(raw, list):
+        return []
+    parsed: List[CitationOut] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            parsed.append(CitationOut(**item))
+        except ValidationError:
+            # 单条结构不合法：跳过并记录，不影响其余引用展示
+            logger.warning("跳过一条结构非法的引用记录：%s", str(item)[:100])
+    return parsed
 
 
 @router.get("", response_model=list[ConversationSummary], summary="会话列表")
@@ -140,6 +173,13 @@ async def get_conversation(
     except ConversationNotFound:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在或无权访问")
 
+    # P6-F2：批量取出当前用户对本会话各条回答的反馈（一次查询，避免 N+1）。
+    # 必须随历史一起下发，否则刷新页面后点赞/点踩按钮会「忘记」已评价过，
+    # 用户会重复提交且看不到自己填过的差评原因。
+    feedback_map = await feedback_service.load_feedback_map(
+        db, user_id, [m.id for m in messages]
+    )
+
     return ConversationDetail(
         id=str(conv.id),
         title=conv.title,
@@ -152,6 +192,15 @@ async def get_conversation(
                 role=m.role,
                 content=m.content,
                 created_at=m.created_at.isoformat() if m.created_at else "",
+                # P4-B2：助手消息的引用来源（历史消息当时未启用检索时为空列表）。
+                # 用 Pydantic 校验后再下发，保证历史数据里的脏结构不会打挂接口。
+                citations=_parse_citations(m.citations),
+                # P6-F2：未评价 / 非助手消息为 None
+                feedback=(
+                    FeedbackOut(**feedback_service.to_payload(feedback_map[m.id]))
+                    if m.id in feedback_map
+                    else None
+                ),
             )
             for m in messages
         ],

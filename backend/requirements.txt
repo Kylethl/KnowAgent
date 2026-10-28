@@ -56,3 +56,20 @@ minio>=7.2.0
 # 读取 .docx 文本：P3-B1 管理员在线预览用；P3-A1 入库切片复用同一套解析。
 # 采用懒导入（见 services/review_service.py），未安装时 Word 预览降级为提示文案。
 python-docx>=1.1.0
+
+# ---------- 检索缓存（P4-DB1：高频命中缓存到 Redis） ----------
+# redis 异步客户端（redis.asyncio）：缓存检索结果，避免重复 embedding 与向量查询。
+# 采用懒导入（见 services/retrieval_cache.py），未安装或 Redis 不可达时
+# 自动回退为进程内 TTL+LRU 缓存，不影响对话可用性。
+redis>=5.0
+
+# ---------- 多模态（P5 功能1/2：图片 OCR、音视频 ASR） ----------
+# Pillow：图片送 OCR 前统一压缩到长边 1600px，避免手机原图 base64 后请求体过大。
+# 采用懒导入（见 services/media_extract._prepare_image_bytes），未安装时原样送模型。
+Pillow>=10.0.0
+# imageio-ffmpeg：随包附带**静态 ffmpeg 二进制**，用于
+#   ① 视频提取音轨（-vn 丢弃视频流）② 音频转 16k 单声道 ③ 长音频按时长切片 ④ 探测时长。
+# 为什么用它而不是系统 apt/brew 装 ffmpeg：
+#   本机开发与容器镜像行为一致，不需要 root 权限，也不会因 base 镜像缺 ffmpeg 而功能失效。
+# 若部署环境已自带 ffmpeg，可在 .env 中用 MEDIA_FFMPEG_BIN 指向系统路径，优先使用。
+imageio-ffmpeg>=0.5.0

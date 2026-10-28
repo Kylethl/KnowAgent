@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ChatMessage, StreamStatus } from '../types';
+import type { ChatMessage, Citation, RetrievalInfo, StreamStatus } from '../types';
 import { startChatStream } from '../services/chatStream';
 
 // P1-F2：对话流式状态钩子
@@ -12,6 +12,19 @@ import { startChatStream } from '../services/chatStream';
 //     钩子通过回调通知父组件绑定到左侧列表；
 //   - 支持 loadMessages / reset：切换会话时把后端返回的历史直接装载进视图（续聊保持上下文），
 //     或清空消息开新会话。
+//
+// P4-F1 增强：
+//   - 接收后端 retrieval 帧，把「知识库检索状态」挂到本轮助手消息上，
+//     供 MessageBubble 渲染徽标（命中 N 段资料 / 未命中 / 未启用 / 降级）。
+//
+// P4-F2 增强：
+//   - 接收后端 citations 帧（正文之后、[DONE] 之前），把引用来源挂到本轮助手消息上，
+//     供 CitationList 渲染引用卡片；历史消息的引用由 loadMessages 一并装载。
+//
+// P6-F2 增强：
+//   - 接收后端 message 帧（落库后下发），把「真实消息 ID」写入 ChatMessage.serverId。
+//     流式气泡的 id 是前端生成的临时值，不能用于 /messages/{id}/feedback；
+//     没有这一步，点赞/点踩按钮将永远不出现（见 FeedbackButtons 的前置条件）。
 
 // 打字机参数：每个节拍渲染的字符数与节拍间隔（毫秒）
 const CHARS_PER_TICK = 2;
@@ -174,6 +187,31 @@ export function useChatStream(options: UseChatStreamOptions) {
         // P2-F1：后端回传新建会话 ID，通知父组件绑定到左侧列表
         onConversation: (id) => {
           onConversationCreatedRef.current?.(id);
+        },
+        // P4-F1：检索状态帧 —— 挂到本轮助手消息。
+        // 说明：retrieval 帧在正文分片之前到达，此时气泡仍显示「思考中」，
+        //      徽标先出现能让用户看到「已检索到 N 段资料」，减少等待焦虑。
+        onRetrieval: (info: RetrievalInfo) => {
+          const targetId = assistantMsg.id;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === targetId ? { ...m, retrieval: info } : m))
+          );
+        },
+        // P4-F2：引用来源帧 —— 挂在回答之后（正文已渲染完），卡片出现在气泡下方。
+        // 空数组也要写入：表示「本轮检索了但没有任何引用」，与「未启用检索」区分。
+        onCitations: (items: Citation[]) => {
+          const targetId = assistantMsg.id;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === targetId ? { ...m, citations: items } : m))
+          );
+        },
+        // P6-F2：后端落库后的消息回执 —— 把真实消息 ID 绑定到本轮助手气泡。
+        // 拿到它之后，MessageBubble 才会渲染点赞/点踩按钮（无 ID 时按钮不出现）。
+        onMessage: (info) => {
+          const targetId = assistantMsg.id;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === targetId ? { ...m, serverId: info.id } : m))
+          );
         },
       });
     },

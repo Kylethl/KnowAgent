@@ -231,3 +231,34 @@ async def require_admin(
         logger.warning("越权访问被拦截：user=%s，role=%s", user.username, user.role)
         raise ForbiddenError("需要管理员权限")
     return user
+
+
+async def require_admin_media(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
+    token: Optional[str] = Query(
+        default=None,
+        description="JWT 访问令牌（浏览器 <img>/<audio>/<video> 无法带请求头时的备用传参）",
+    ),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """P5 媒体预览专用鉴权：同时支持请求头与 query 令牌，并要求管理员。
+
+    为什么单独一个依赖：
+        管理员审核图片/音视频时，浏览器由 `<img src>` / `<video src>` 直接发起请求，
+        **无法附加 Authorization 头**，只能把令牌放进 query（与 /chat 的 SSE 同理）。
+        而 /admin/* 路由级依赖 require_admin 只认请求头，若沿用会导致媒体永远 401。
+        因此媒体路由单独挂本依赖，其它管理接口仍走严格的头鉴权，不扩大范围。
+
+    Returns:
+        当前管理员用户对象。
+
+    Raises:
+        UnauthorizedError: 未携带或携带了无效令牌（→ 401）。
+        ForbiddenError: 已登录但非 admin（→ 403）。
+    """
+    raw_token = extract_bearer_token(credentials) or token
+    user = await get_user_for_request(db, raw_token)
+    if user.role != "admin":
+        logger.warning("越权访问媒体被拦截：user=%s，role=%s", user.username, user.role)
+        raise ForbiddenError("需要管理员权限")
+    return user

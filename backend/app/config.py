@@ -124,11 +124,19 @@ class Settings(BaseSettings):
     STORAGE_REGION: str = ""
     # 预签名 URL 有效期（秒），供后续下载/预览接口使用（P3 起）
     STORAGE_PRESIGN_EXPIRE: int = 3600
-    # 单文件上传大小上限（字节）：默认 20MB，与前端 documentUpload.ts 的 MAX_FILE_SIZE_MB 一致
+    # 单文件上传大小上限（字节）：默认 20MB，与前端 documentUpload.ts 的 MAX_FILE_SIZE_MB 一致。
+    # ⚠️ 该上限**只管文档类**（word / markdown）；图片/音频/视频的体积量级不同，
+    #    分别由下方 P5 的 MAX_IMAGE_SIZE / MAX_AUDIO_SIZE / MAX_VIDEO_SIZE 控制。
     MAX_UPLOAD_SIZE: int = 20 * 1024 * 1024
-    # 允许上传的扩展名白名单（逗号分隔，小写）。P1 仅 Word / Markdown。
-    # P5 再扩展 image/audio/video。
-    ALLOWED_EXTENSIONS: str = "docx,doc,md"
+    # 允许上传的扩展名白名单（逗号分隔，小写）。
+    # P1 仅 Word / Markdown；P5 扩展图片 / 音频 / 视频（见 services/media_types.py 的分类映射）。
+    # 注意：扩展名只是「第一道门」，真正的类型以文件头魔数校验为准。
+    ALLOWED_EXTENSIONS: str = (
+        "docx,doc,md,"
+        "jpg,jpeg,png,webp,bmp,gif,"
+        "mp3,wav,m4a,aac,flac,ogg,"
+        "mp4,mov,m4v,avi,mkv,webm"
+    )
 
     # ---------- 知识库向量与入库（P3 功能2：RAG 管线） ----------
     # 千问 Embedding 服务的 API Key（阿里云百炼 / DashScope）。
@@ -166,6 +174,113 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 800
     CHUNK_OVERLAP: int = 120
 
+    # ---------- RAG 检索增强（P4 功能1：/chat 检索增强） ----------
+    # 总开关：关闭后 /chat 完全回到 P1/P2 的「无检索」行为（便于对比与排障）。
+    RAG_ENABLED: bool = True
+    # 最终注入 Prompt 的资料条数（重排后的 Top-K）：5 段对中文问答足够，
+    # 再多会挤占上下文预算并抬高 token 成本。
+    RAG_TOP_K: int = 5
+    # 粗排候选数：先按向量距离多召回一些，再交由重排精挑，
+    # 避免「向量近但关键词不相关」的切片占掉 Top-K 名额。
+    RAG_CANDIDATE_K: int = 20
+    # 余弦相似度下限（0~1，越大越严格）：低于该值的切片视为不相关，直接丢弃。
+    # 0.40 由 `scripts/calibrate_rag_threshold.py` 实测标定（当前向量模型）：
+    #   - 无关切片（跨文档两两比对）噪声 p95 ≈ 0.48，取过低的阈值会把无关资料放进 Prompt；
+    #   - 真实相关问句的 Top-1 相似度落在 0.54~0.77，阈值过高会误杀真实问题。
+    # 0.40 位于两者之间且偏向「宁可召回」——漏召回（答「未找到」）比多召回一段
+    # 无关资料更难被用户接受，因为前者会让用户误以为知识库没有该内容。
+    # ⚠️ 换 embedding 模型后必须用该脚本重新标定（不同模型相似度尺度不同）。
+    RAG_SIMILARITY_THRESHOLD: float = 0.40
+    # 注入 Prompt 的参考资料总字符上限（防止上下文无限膨胀，与 CHUNK_SIZE 联动估算）。
+    RAG_MAX_CONTEXT_CHARS: int = 3000
+    # 是否启用重排（rerank）。本项目未接专用 rerank 模型，
+    # 采用「向量相似度 + 查询词覆盖率」的轻量启发式重排（见 services/retriever.py），
+    # 无额外网络开销与费用；接入专用 rerank 服务后可在此处替换实现。
+    RAG_RERANK_ENABLED: bool = True
+    # 是否允许在 embedding 为 mock（未配置真实 QWEN_API_KEY）时仍执行检索。
+    # 默认 False：mock 向量不具备语义相似度，召回结果等同于随机，
+    # 强行检索会把无关资料塞进 Prompt 反而更差，故此时直接标记「检索未启用」。
+    # 仅在做管线联调时可临时置 True。
+    RAG_ALLOW_MOCK_EMBEDDING: bool = False
+    # 检索结果缓存（P4-DB1「高频命中缓存到 Redis」）总开关。
+    RAG_CACHE_ENABLED: bool = True
+    # 缓存有效期（秒）：同一问题短期内重复提问直接复用召回结果，省一次 embedding 调用；
+    # 知识库更新后最多等待该时长即可看到新内容，兼顾新鲜度。
+    RAG_CACHE_TTL: int = 300
+    # 缓存 key 前缀（带版本号，便于检索策略变更后整体失效旧缓存）。
+    RAG_CACHE_KEY_PREFIX: str = "rag:retrieval:v1"
+    # Redis 不可达时进程内回退缓存的最大条目数（LRU 淘汰）。
+    RAG_CACHE_MAX_ITEMS: int = 256
+    # 检索缓存专用的 Redis 地址：与 Celery 的 db0/db1 分开用 db2，避免互相干扰。
+    REDIS_CACHE_URL: str = "redis://localhost:6379/2"
+
+    # ---------- 入库状态自愈（僵死任务判定） ----------
+    # 背景：入库任务被 kill / 进程重启时，documents.status 会永久停留在 'indexing'。
+    # 此时前端（曾）把「重新入库」按钮一律置灰，后端也拒绝重跑，文档就再也入库不了。
+    # 这里把「停留在 indexing 多久算僵死」定义为配置，超过即视为上次任务已中断，
+    # 允许重新入库（前端据 AdminDocumentOut.indexing_stale 把按钮放开）。
+    INDEXING_STALE_MINUTES: int = 10
+    # 媒体类（图片/音视频）阈值放宽：OCR/ASR 走外部大模型，长视频转写可能远超 10 分钟，
+    # 阈值过短会把「正在跑」误判成「已僵死」，导致并发重跑、重复计费。
+    MEDIA_INDEXING_STALE_MINUTES: int = 60
+
+    # ---------- 多模态提交（P5 功能1：图片 / 音频 / 视频） ----------
+    # 各类型单文件体积上限（字节）。分级的原因：
+    #   图片通常几百 KB~几 MB，给 10MB 足够容纳手机原图；
+    #   音频（会议录音/播客）常在几十 MB，给 50MB；
+    #   视频体积最大，给 200MB —— 再大就不是「知识库素材」而是长视频，应走专门的上传通道。
+    # 说明：上限越大，单次请求的内存/磁盘与解析耗时越高（解析阶段要转写/OCR）。
+    MAX_IMAGE_SIZE: int = 10 * 1024 * 1024
+    MAX_AUDIO_SIZE: int = 50 * 1024 * 1024
+    MAX_VIDEO_SIZE: int = 200 * 1024 * 1024
+    # 是否校验「文件头魔数」与扩展名一致（默认开启）。
+    # 仅靠扩展名可被轻易伪造（把 .exe 改名成 .png），魔数校验能挡住绝大多数伪装文件；
+    # 极端场景（如未知容器格式）无法判定时按放行处理，避免误杀合法素材。
+    MEDIA_VERIFY_MAGIC: bool = True
+    # 病毒扫描（《需求清单》P5「病毒扫描（建议）」）：接 ClamAV 的 clamd TCP 接口。
+    # 默认关闭；**一旦开启即 fail-closed**——clamd 不可达时拒收文件，
+    # 因为「以为扫了其实没扫」比明确报错更危险。
+    VIRUS_SCAN_ENABLED: bool = False
+    VIRUS_SCAN_HOST: str = "127.0.0.1"
+    VIRUS_SCAN_PORT: int = 3310
+    VIRUS_SCAN_TIMEOUT: float = 10.0
+
+    # ---------- 多模态解析（P5 功能2：OCR / ASR） ----------
+    # 总开关：关闭后图片/音视频仍可提交与审核，但入库会明确失败（不静默跳过），
+    # 避免「文档显示已入库却检索不到」的困惑。
+    MEDIA_EXTRACT_ENABLED: bool = True
+    # 多模态理解服务的地址与 Key。
+    # 本项目复用千问百炼 compatible-mode 网关（与 embedding 同一个网关、同一个 Key），
+    # 留空则自动回退到 QWEN_EMBEDDING_BASE_URL / QWEN_API_KEY，减少重复配置。
+    MEDIA_LLM_BASE_URL: str = ""
+    MEDIA_LLM_API_KEY: str = ""
+    # 图片 OCR 模型：实测 qwen3.5-ocr 能按行精确提取中文文字（qwen-vl-ocr 只回坐标框，
+    # 无法直接得到文本，故不采用）。换模型需保证「输入 image_url → 输出纯文本」。
+    MEDIA_OCR_MODEL: str = "qwen3.5-ocr"
+    # 音频/视频转写模型：实测 qwen3.8-omni-flash 支持 OpenAI 风格 input_audio（data URI），
+    # 按「逐字转写」提示词可得到干净文本。网关上的 fun-asr / qwen-audio-asr 走的是
+    # 实时 WebSocket 协议，compatible-mode 的 chat/completions 不接受，故不采用。
+    MEDIA_ASR_MODEL: str = "qwen3.8-omni-flash"
+    # 单次多模态请求超时（秒）：OCR 通常数秒，长音频转写可能数十秒，取较宽松值。
+    MEDIA_EXTRACT_TIMEOUT: float = 180.0
+    # 图片送模型前的最长边（像素）与 JPEG 压缩质量：
+    # 手机原图 4000px 以上，base64 后体积巨大且 OCR 并不需要那么高分辨率，
+    # 统一压到 1600px / q85 既能保证文字清晰，又能把请求体压到 1MB 内。
+    MEDIA_IMAGE_MAX_EDGE: int = 1600
+    MEDIA_IMAGE_JPEG_QUALITY: int = 85
+    # 音频分片转写：单段秒数与最大段数。
+    # 一次性把 1 小时音频塞给模型不现实（超时/超限），故用 ffmpeg 按时长切片、逐段转写后拼接。
+    MEDIA_ASR_SEGMENT_SECONDS: int = 300
+    MEDIA_ASR_MAX_SEGMENTS: int = 40
+    # 视频是否额外抽帧做 OCR（默认关闭）：抽帧 OCR 对「PPT 类视频」有价值，
+    # 但每帧都是一次模型调用，费用与时延成倍增长，需要时再显式打开。
+    MEDIA_VIDEO_OCR_ENABLED: bool = False
+    # 视频抽帧间隔（秒），仅当 MEDIA_VIDEO_OCR_ENABLED=true 时生效
+    MEDIA_VIDEO_OCR_INTERVAL: int = 60
+    # 从视频中提取音轨的工具：优先用配置的 ffmpeg；未安装时自动回退到
+    # macOS 自带的 avconvert（仅供本地开发），两者都没有则明确报错。
+    MEDIA_FFMPEG_BIN: str = "ffmpeg"
+
     # ---------- 异步任务（P3-B2：Celery + Redis） ----------
     # Celery 的消息队列与结果后端（P3-Dep1 引入 Redis）。
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"
@@ -173,6 +288,11 @@ class Settings(BaseSettings):
     # 是否使用 Celery 执行入库任务。置 False 或未装 celery / Redis 不可达时，
     # 后端自动回退为「进程内后台任务」，保证开发期无 Redis 也能跑通入库闭环。
     USE_CELERY: bool = True
+    # 多模态（OCR/ASR）任务专用队列名（P5-Dep1「worker 独立/扩容」）。
+    # 为什么单独排队：音视频转写耗时可达数分钟且吃算力，和普通文档入库抢同一个 worker
+    # 会让「刚上传的 Word」排在长视频后面；独立队列后可单独扩容媒体 worker。
+    # 置空字符串表示不区分队列（全部走默认队列），便于小规模部署。
+    CELERY_MEDIA_QUEUE: str = "media"
 
     # ---------- 日志 ----------
     LOG_LEVEL: str = "INFO"
@@ -223,6 +343,76 @@ class Settings(BaseSettings):
         """
         key = (self.QWEN_API_KEY or "").strip()
         return bool(key) and not key.startswith("sk-REPLACE_ME")
+
+    @property
+    def is_rag_ready(self) -> bool:
+        """判断当前配置下 RAG 检索是否「有意义」可跑（P4 功能1）。
+
+        两个条件同时满足才视为可用：
+          1. RAG_ENABLED 已开启；
+          2. embedding 具备语义能力——要么已配置真实 QWEN Key，
+             要么显式允许 mock（RAG_ALLOW_MOCK_EMBEDDING=True，仅供管线联调）。
+
+        说明：mock 向量由文本哈希生成，相似度不反映语义，
+        用它检索等于随机挑资料，因此默认不启用检索（返回「未启用」而非乱答）。
+        """
+        if not self.RAG_ENABLED:
+            return False
+        return self.is_qwen_configured or self.RAG_ALLOW_MOCK_EMBEDDING
+
+    # ---------- 多模态相关派生配置（P5） ----------
+
+    @property
+    def media_llm_base_url(self) -> str:
+        """多模态理解服务地址：未单独配置时复用 embedding 网关（同一个百炼网关）。
+
+        Returns:
+            形如 https://.../compatible-mode/v1 的**不含** /chat/completions 的基础地址。
+        """
+        return (self.MEDIA_LLM_BASE_URL or "").strip() or self.QWEN_EMBEDDING_BASE_URL
+
+    @property
+    def media_llm_api_key(self) -> str:
+        """多模态理解服务的 Key：未单独配置时复用 QWEN_API_KEY。"""
+        return (self.MEDIA_LLM_API_KEY or "").strip() or self.QWEN_API_KEY
+
+    @property
+    def is_media_ocr_ready(self) -> bool:
+        """判断图片 OCR 是否可用（P5 功能2 启动自检与前端提示用）。
+
+        与 embedding 不同，OCR **没有 mock 兜底**：伪文字一旦入库会污染知识库，
+        因此未配置 Key 时直接判定为不可用，入库会以明确错误失败。
+        """
+        if not self.MEDIA_EXTRACT_ENABLED:
+            return False
+        key = (self.media_llm_api_key or "").strip()
+        return bool(key) and not key.startswith("sk-REPLACE_ME")
+
+    @property
+    def is_media_asr_ready(self) -> bool:
+        """判断音频/视频转写是否可用（同 OCR，没有 mock 兜底）。"""
+        return self.is_media_ocr_ready
+
+    def max_upload_size_for(self, file_type: str) -> int:
+        """按文件类型返回单文件体积上限（字节）。
+
+        Args:
+            file_type: 文档类型（word / markdown / image / audio / video）。
+
+        Returns:
+            对应类型的上限字节数；未知类型回退到文档上限 MAX_UPLOAD_SIZE。
+        """
+        if file_type == "image":
+            return self.MAX_IMAGE_SIZE
+        if file_type == "audio":
+            return self.MAX_AUDIO_SIZE
+        if file_type == "video":
+            return self.MAX_VIDEO_SIZE
+        return self.MAX_UPLOAD_SIZE
+
+    def max_upload_size_mb_for(self, file_type: str) -> float:
+        """按类型返回上限的 MB 表示（用于错误提示与前端文案）。"""
+        return round(self.max_upload_size_for(file_type) / (1024 * 1024), 2)
 
 
 @lru_cache(maxsize=1)

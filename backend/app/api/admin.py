@@ -24,11 +24,13 @@
 #   - 不返回可拼接的下载直链，预览内容一律经本接口鉴权后下发。
 
 from typing import Dict, List, Optional
+from urllib.parse import quote
 from uuid import UUID
 
 import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.errors import (
@@ -38,7 +40,7 @@ from ..core.errors import (
     ReviewNotAllowed,
 )
 from ..core.logging import get_logger
-from ..core.security import require_admin
+from ..core.security import require_admin, require_admin_media
 from ..db.engine import get_db
 from ..db.models import Document, User
 from ..schemas import (
@@ -49,7 +51,8 @@ from ..schemas import (
     ReviewRequest,
     ReviewResult,
 )
-from ..services import indexing_service, review_service
+from ..services import embedding as embedding_mod
+from ..services import indexing_service, media_types, review_service
 from ..services.storage import BaseStorage, StorageError
 # 复用 /documents 中已定义的存储依赖，保证两种场景用同一套后端构造逻辑
 from .documents import get_storage_dep
@@ -111,6 +114,16 @@ def _to_out(doc: Document, usernames: Dict[UUID, str]) -> AdminDocumentOut:
         chunk_count=doc.chunk_count or 0,
         indexed_at=doc.indexed_at.isoformat() if doc.indexed_at else None,
         last_index_error=doc.last_index_error,
+        # P4：向量时效性——已入库且有切片，但入库时的模型与当前配置不可比
+        #（mock 向量 / 换过模型 / 历史数据未记录），管理员应点「重新入库」
+        embedding_model=doc.embedding_model,
+        embedding_stale=bool(doc.chunk_count) and embedding_mod.embedding_is_stale(doc.embedding_model),
+        # P5 修复：入库僵死自愈 —— 前端据此决定「重新入库」按钮是否可点。
+        # 必须由后端判定（阈值按文档类型不同），前端不要自行用时间差猜。
+        indexing_stale=indexing_service.is_indexing_stale(doc),
+        indexing_elapsed_seconds=indexing_service.indexing_elapsed_seconds(doc),
+        # P5：多模态解析元信息（文档类为 None）
+        extract_meta=doc.extract_meta,
     )
 
 
@@ -140,17 +153,18 @@ async def _run_indexing_async(document_id: str) -> None:
         logger.error("进程内入库任务失败：document_id=%s，原因=%s", document_id, exc)
 
 
-def _dispatch_indexing(document_id) -> bool:
+def _dispatch_indexing(document_id, file_type: str = "word") -> bool:
     """触发文档入库：优先投递 Celery，不可用时回退为进程内后台任务。
 
     Args:
         document_id: 文档 ID。
+        file_type: 文档类型；图片/音视频会被投递到独立 media 队列（P5）。
 
     Returns:
         True 表示已投递 Celery（异步）；False 表示走进程内后台任务。
     """
     # 1) 优先走 Celery（生产路径：独立 worker 执行，不占用 Web 进程）
-    if indexing_service.enqueue_index_document(document_id):
+    if indexing_service.enqueue_index_document(document_id, file_type):
         return True
 
     # 2) 回退：在同一事件循环里创建后台任务，请求可立即返回
@@ -254,7 +268,7 @@ async def review_document(
     # P3-B2：审核通过即触发入库（「审核通过 → 入库」链路的关键衔接点）。
     # 投递失败（无 Redis）时由进程内后台任务兜底，保证链路不断。
     if payload.action == "approved":
-        queued = _dispatch_indexing(updated.id)
+        queued = _dispatch_indexing(updated.id, updated.file_type)
         logger.info(
             "文档 %s 审核通过，已触发入库（%s）",
             document_id,
@@ -299,7 +313,7 @@ async def index_document(
     # 只做校验 + 投递：状态由服务层统一置为 indexing。
     # ⚠️ 这里**不预先**把 status 改成 indexing —— 否则服务层进入管线时
     #    会认为「已有入库任务在跑」而自我拒绝（IndexingInProgress）。
-    queued = _dispatch_indexing(doc.id)
+    queued = _dispatch_indexing(doc.id, doc.file_type)
     logger.info("管理员 %s 触发文档入库：%s", admin.username, document_id)
 
     return IndexResult(
@@ -390,4 +404,89 @@ async def preview_document(
         text=text,
         truncated=truncated,
         previewable=previewable,
+        # P5：多模态解析元信息（模型/耗时/时长），前端据此展示「OCR 用了什么模型」
+        extract_meta=doc.extract_meta,
+    )
+
+
+# =====================================================================
+# 媒体原文件预览（P5）
+# ---------------------------------------------------------------------
+# 为什么要单独一个 router：
+#   /admin/* 的路由级依赖 require_admin 只认 Authorization 头，
+#   而浏览器侧 <img src>/<audio src>/<video src> 无法附加请求头，
+#   只能把令牌放 query（与 /chat 的 SSE 同理）。
+#   因此媒体流接口单独挂 require_admin_media（兼容头 + query），
+#   其余管理接口仍保持严格的头鉴权，不扩大令牌暴露面。
+# =====================================================================
+
+media_router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@media_router.get(
+    "/documents/{document_id}/media",
+    summary="媒体原文件（图片/音频/视频，管理员审核用）",
+    description=(
+        "以流式响应返回图片/音频/视频原始内容，供管理员在审核界面直接查看/播放。"
+        "仅管理员可访问；令牌可放在 Authorization 头或 ?token= 查询参数（浏览器媒体标签无法设置请求头）。"
+    ),
+)
+async def get_document_media(
+    document_id: str,
+    db: AsyncSession = Depends(get_db),
+    storage: BaseStorage = Depends(get_storage_dep),
+    admin: User = Depends(require_admin_media),
+):
+    """流式返回媒体原文件（不做转码，不落缓存）。
+
+    采用流式而非常规 FileResponse：存储后端可能是 MinIO，本地未必有对应文件路径，
+    而 StreamingResponse 对两种后端一致，且不会把 200MB 视频整段读入内存。
+
+    Args:
+        document_id: 文档 ID。
+        db: 数据库会话。
+        storage: 存储后端。
+        admin: 当前管理员（依赖已校验）。
+
+    Returns:
+        StreamingResponse：媒体字节流，Content-Type 取自入库时记录的 MIME。
+
+    Raises:
+        HTTPException 404: 文档不存在/已删除。
+        HTTPException 400: 该文档不是媒体类型（文本内容请用 /preview）。
+        HTTPException 502: 存储读取失败。
+    """
+    try:
+        doc = await review_service.get_document_for_review(db, document_id)
+    except DocumentNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.message) from exc
+
+    # 只有多模态类型走本接口；文档类请用 /preview 看文本
+    if doc.file_type not in ("image", "audio", "video"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该文档不是图片/音频/视频，请使用文本预览接口",
+        )
+
+    # MIME 以入库时记录为准，缺失时按扩展名兜底
+    ext = doc.original_path.rsplit(".", 1)[-1].lower() if "." in doc.original_path else ""
+    media_type = doc.mime_type or media_types.guess_mime(ext)
+
+    headers = {
+        # inline：让浏览器直接展示/播放，而不是触发下载
+        "Content-Disposition": f"inline; filename*=UTF-8''{quote(doc.filename)}",
+        # 媒体内容属用户提交内容，禁止中间代理缓存（审核后台属敏感界面）
+        "Cache-Control": "private, max-age=0, no-store",
+        # 未实现 Range：明确告知浏览器，避免其反复发起分段请求
+        "Accept-Ranges": "none",
+    }
+    # Content-Length 便于浏览器显示进度条（size_bytes 入库时已记录）
+    if doc.size_bytes:
+        headers["Content-Length"] = str(doc.size_bytes)
+
+    logger.info("管理员 %s 查看媒体原文件 %s（%s）", admin.username, document_id, media_type)
+    return StreamingResponse(
+        storage.iter_object(doc.original_path),
+        media_type=media_type,
+        headers=headers,
     )

@@ -24,10 +24,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..core.logging import get_logger
 from ..core.security import get_current_user_id
 from ..db.engine import get_db
-from ..db.models import Document
-from ..schemas import DocumentUploadResponse, MyDocumentListResponse, MyDocumentOut
+from ..db.models import Document, DocumentChunk
+from ..schemas import (
+    ChunkDetailResponse,
+    DocumentUploadResponse,
+    MyDocumentListResponse,
+    MyDocumentOut,
+)
 from ..services import documents as documents_service
-from ..services import storage as storage_mod
+from ..services import embedding as embedding_mod
 from ..services.documents import UploadValidationError
 from ..services.storage import BaseStorage, StorageError, build_storage
 
@@ -49,18 +54,23 @@ def get_storage_dep() -> BaseStorage:
     "/documents/upload",
     response_model=DocumentUploadResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="上传文档（仅 Word / Markdown）",
+    summary="上传文档（Word / Markdown / 图片 / 音频 / 视频）",
     description=(
-        "接收 .doc/.docx/.md 文件，做格式白名单 + 大小 + 空文件校验，"
-        "原始文件写入对象存储（MinIO 或本地目录），元数据与路径写入 documents 表。"
-        "返回文档记录，状态固定为 pending（待审核）。"
+        "接收 .doc/.docx/.md 以及图片（jpg/png/webp/bmp/gif）、音频（mp3/wav/m4a/aac/flac/ogg）、"
+        "视频（mp4/mov/m4v/avi/mkv/webm）。校验包括：扩展名白名单、危险双扩展名、"
+        "按类型分级的大小上限（图片 10MB / 音频 50MB / 文档 20MB / 视频 200MB）、"
+        "文件头魔数与扩展名一致性、可选 ClamAV 病毒扫描。"
+        "原始文件写入对象存储（MinIO 或本地目录），元数据与路径写入 documents 表，"
+        "状态固定为 pending（待审核）。图片/音视频的文本内容在入库阶段经 OCR/ASR 提取。"
     ),
 )
 async def upload_document(
     # file：原始文件，必须；前端字段名固定为 'file'
-    file: UploadFile = File(..., description="原始文件（.doc / .docx / .md）"),
-    # type：前端附带的类型提示（word/markdown），用于后端二次校验；非必填
-    doc_type: Optional[str] = Form(None, alias="type", description="类型提示 word/markdown，用于二次校验"),
+    file: UploadFile = File(..., description="原始文件（文档 / 图片 / 音频 / 视频）"),
+    # type：前端附带的类型提示（word/markdown/image/audio/video），用于后端二次校验；非必填
+    doc_type: Optional[str] = Form(
+        None, alias="type", description="类型提示 word/markdown/image/audio/video，用于二次校验"
+    ),
     # P2-B2：提交人由 JWT 令牌解析（不再接受表单自报 user_id，杜绝身份伪造）
     current_user_id: UUID = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
@@ -159,8 +169,114 @@ async def list_my_documents(
                 # 入库失败会回退 status 为 approved，故把失败原因一并下发，
                 # 前端据此区分「已通过待入库」与「入库失败」
                 last_index_error=doc.last_index_error,
+                # P4：向量时效性——只有「已入库且有切片」的文档才需要判断：
+                # 未入库必然没有向量，提示「向量过期」只会造成困惑。
+                embedding_model=doc.embedding_model,
+                embedding_stale=bool(doc.chunk_count)
+                and embedding_mod.embedding_is_stale(doc.embedding_model),
+                # P5：多模态解析元信息（图片/音视频入库后才有值），
+                # 用户侧据此看到「音频时长/识别字符数」等，理解为什么检索得到它
+                extract_meta=doc.extract_meta,
             )
             for doc in rows
         ],
         total=total,
+    )
+
+
+@router.get(
+    "/documents/{document_id}/chunks/{chunk_id}",
+    response_model=ChunkDetailResponse,
+    summary="引用原文片段（点击引用卡片查看）",
+    description=(
+        "按 chunk_id 返回知识库切片的完整正文与相邻片段，供答案引用卡片「可跳转」查看原文。"
+        "仅对**已入库**（status=indexed）且未删除的文档开放："
+        "未审核/已驳回/已下线的文档不会出现在检索结果中，也不应能被单独窥探。"
+        "本接口不返回原始文件，不扩大数据暴露面。"
+    ),
+)
+async def get_chunk_detail(
+    document_id: str,
+    chunk_id: str,
+    # P2-B2：要求登录——知识库是共享的，但不对匿名开放
+    _current_user_id: UUID = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+) -> ChunkDetailResponse:
+    """返回指定切片的正文、章节与相邻切片 ID（P4-F2 引用跳转的数据源）。
+
+    流程：参数解析 → 文档可用性校验（已入库 + 未删除）→ 取目标切片 →
+    取同文档全部切片 ID 序列（用于计算 prev/next 与 total）。
+
+    Args:
+        document_id: 文档 ID（UUID 字符串）。
+        chunk_id: 切片 ID（UUID 字符串）。
+        _current_user_id: 当前登录用户（仅要求登录，不校验归属——共享知识库）。
+        db: 数据库会话。
+
+    Returns:
+        ChunkDetailResponse。
+
+    Raises:
+        HTTPException: 400（ID 非法）/ 404（文档不可见或切片不属于该文档）。
+    """
+    # 1) ID 格式校验：非法格式与「不存在」同样返回 404，避免泄露库内 ID 规则
+    try:
+        doc_uuid = UUID(document_id)
+        chunk_uuid = UUID(chunk_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="引用片段不存在")
+
+    # 2) 文档可用性：只有已入库且未删除的文档才可被引用查看
+    doc = (
+        await db.execute(
+            select(Document).where(
+                Document.id == doc_uuid,
+                Document.status == "indexed",
+                Document.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="引用片段不存在")
+
+    # 3) 取该文档的全部切片 ID（按序号升序）：一次查询同时算出 total 与 prev/next，
+    #    避免再为相邻片段单独查两次库
+    ordered = (
+        (
+            await db.execute(
+                select(DocumentChunk.id, DocumentChunk.chunk_index)
+                .where(DocumentChunk.doc_id == doc_uuid)
+                .order_by(DocumentChunk.chunk_index.asc())
+            )
+        )
+        .all()
+    )
+    ids = [str(row.id) for row in ordered]
+    if chunk_id not in ids:
+        # 切片不属于该文档（或已被重入库替换）→ 统一 404，不区分细节
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="引用片段不存在")
+
+    # 4) 取目标切片正文与元信息
+    target = (
+        await db.execute(
+            select(DocumentChunk).where(DocumentChunk.id == chunk_uuid)
+        )
+    ).scalar_one_or_none()
+    if target is None:  # 并发下线/重入库导致刚被删除
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="引用片段不存在")
+
+    pos = ids.index(chunk_id)
+    meta = target.metadata_json or {}
+    return ChunkDetailResponse(
+        doc_id=str(doc.id),
+        doc_title=doc.filename,
+        file_type=doc.file_type,
+        chunk_id=str(target.id),
+        chunk_index=int(target.chunk_index or 0),
+        total_chunks=len(ids),
+        heading=str(meta.get("heading") or ""),
+        content=target.content or "",
+        # 首段无上一段、末段无下一段
+        prev_chunk_id=ids[pos - 1] if pos > 0 else None,
+        next_chunk_id=ids[pos + 1] if pos + 1 < len(ids) else None,
     )

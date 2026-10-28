@@ -16,19 +16,29 @@ import {
 } from 'antd';
 import {
   ArrowLeftOutlined,
+  AudioOutlined,
+  BarChartOutlined,
   CheckOutlined,
   CloseOutlined,
   EyeOutlined,
+  PictureOutlined,
   ReloadOutlined,
   StopOutlined,
   FileTextOutlined,
+  VideoCameraOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 import TopBar from '../components/TopBar';
+import FeedbackSummaryDrawer from '../components/FeedbackSummaryDrawer';
+import { statusLabel } from '../components/DocumentStatusTag';
 import { useAuth } from '../hooks/useAuth';
-import { listAdminDocuments, previewDocument, reviewDocument } from '../services/adminApi';
+import { adminDocumentMediaUrl, listAdminDocuments, previewDocument, reviewDocument } from '../services/adminApi';
 import { adminReindexDocument, adminUnpublishDocument } from '../services/documentApi';
 import type { AdminDocument, DocStatus, DocumentPreview, ReviewStatus } from '../types';
+// 行级业务规则抽成纯函数（见 utils/adminRules.ts）：
+// 「按钮是否可点」这类判定必须能被单测锁死——历史上正是因为
+// `status === 'indexing'` 一律禁用，导致僵死文档只剩「预览」可用、永远无法重新入库。
+import { canReindex, canUnpublish, isIndexingStuck, stuckMinutes } from '../utils/adminRules';
 
 // P3-F1：管理员审核后台页
 // ---------------------------------------------------------------------
@@ -46,6 +56,9 @@ import type { AdminDocument, DocStatus, DocumentPreview, ReviewStatus } from '..
 //
 // 权限说明：进入本页前已由 RequireAdmin 保证 role='admin'；
 //           接口层仍由后端 require_admin 兜底，前端不做最终裁决。
+//
+// P6-F2：标题区新增「反馈评估」入口，打开抽屉查看用户点赞/点踩的汇总
+//        （好评率、点踩归因分布、最近差评明细），作为优化 prompt 与检索的依据。
 
 // 审核结论筛选选项：'all' 为前端约定的「不过滤」值，不传给后端
 type FilterValue = ReviewStatus | 'all';
@@ -58,6 +71,29 @@ const STATUS_META: Record<DocStatus, { color: string; text: string }> = {
   indexing: { color: 'blue', text: '入库中' },
   indexed: { color: 'cyan', text: '已入库' },
 };
+
+/** 文件类型 → 展示文案与图标（P5 起区分图片/音频/视频）。 */
+const TYPE_META: Record<string, { label: string; icon: JSX.Element }> = {
+  word: { label: 'Word', icon: <FileTextOutlined /> },
+  markdown: { label: 'Markdown', icon: <FileTextOutlined /> },
+  image: { label: '图片', icon: <PictureOutlined /> },
+  audio: { label: '音频', icon: <AudioOutlined /> },
+  video: { label: '视频', icon: <VideoCameraOutlined /> },
+};
+
+/** 媒体类型集合：决定预览时用 <img>/<audio>/<video> 而非文本块。 */
+const MEDIA_TYPES = ['image', 'audio', 'video'];
+
+/** 把秒数格式化为 m:ss / h:mm:ss；未知返回 null。 */
+function formatDuration(seconds?: number | null): string | null {
+  if (!seconds || seconds <= 0) return null;
+  const total = Math.round(seconds);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
 
 /** 把字节数格式化为可读文本（B / KB / MB）。 */
 function formatSize(bytes: number): string {
@@ -108,6 +144,9 @@ export default function AdminPage() {
 
   // ---------- 入库操作状态（重新入库 / 下线） ----------
   const [indexingId, setIndexingId] = useState<string | null>(null); // 正在执行入库操作的文档 ID
+
+  // ---------- P6-F2：答案反馈评估抽屉 ----------
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
 
   /**
    * 拉取审核队列。
@@ -276,8 +315,17 @@ export default function AdminPage() {
       {
         title: '类型',
         dataIndex: 'file_type',
-        width: 90,
-        render: (t: string) => (t === 'word' ? 'Word' : 'Markdown'),
+        width: 100,
+        // P5：类型从 2 种扩展到 5 种，统一按映射表渲染（含图标，便于快速区分媒体）
+        render: (t: string) => {
+          const meta = TYPE_META[t] ?? { label: t, icon: <FileTextOutlined /> };
+          return (
+            <Space size={4}>
+              {meta.icon}
+              <span>{meta.label}</span>
+            </Space>
+          );
+        },
       },
       {
         title: '大小',
@@ -312,8 +360,47 @@ export default function AdminPage() {
               </Tooltip>
             );
           }
+          // 入库僵死（P5 修复）：上次入库被进程重启/worker 杀死，任务不会自行结束。
+          // 必须显著区别于「入库中」，否则管理员会误以为「在跑，等着就好」——
+          // 而实际上它永远不会完成，且该状态下「重新入库」本应可用。
+          if (isIndexingStuck(row)) {
+            // 分钟数取后端下发的已持续时长（前端不自行推算阈值）
+            const minutes = stuckMinutes(row.indexing_elapsed_seconds) ?? 1;
+            return (
+              <Tooltip
+                title={
+                  `上次入库已中断：文档停留在「入库中」约 ${minutes} 分钟，超过僵死阈值，` +
+                  '后台任务不会再自行结束。点击「重新入库」重跑即可恢复。'
+                }
+              >
+                <Tag color="volcano">入库卡住</Tag>
+              </Tooltip>
+            );
+          }
           const meta = STATUS_META[s] ?? { color: 'default', text: s };
-          return <Tag color={meta.color}>{meta.text}</Tag>;
+          // P5：媒体类在入库阶段实际是 OCR/ASR 解析，文案显示「解析中」更贴合等待时长
+          const text = statusLabel(s, row.file_type);
+          // P4：向量过期提示（mock 向量 / 换过模型 / 历史未记录）。
+          // 这类文档虽显示「已入库」，但检索结果不可信，需管理员点「重新入库」刷新向量，
+          // 因此与状态标签并列展示，避免管理员误判为「已可用」。
+          if (row.embedding_stale) {
+            return (
+              <span style={{ display: 'inline-flex', gap: 4 }}>
+                <Tag color={meta.color}>{text}</Tag>
+                <Tooltip
+                  title={
+                    `该文档的向量由「${row.embedding_model ?? '未知模型'}」生成，与当前向量模型不一致，` +
+                    '检索结果不可靠。请点击「重新入库」重建向量。'
+                  }
+                >
+                  <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+                    向量过期
+                  </Tag>
+                </Tooltip>
+              </span>
+            );
+          }
+          return <Tag color={meta.color}>{text}</Tag>;
         },
       },
       {
@@ -377,17 +464,17 @@ export default function AdminPage() {
             >
               驳回
             </Button>
-            {/* 重新入库：仅审核通过且未在入库中的文档可触发；入库中禁用避免并发 */}
+            {/* 重新入库：需审核通过；入库中禁用，但**僵死必须放行**（判据见 canReindex）。 */}
             <Button
               size="small"
               icon={<ReloadOutlined />}
-              disabled={row.status === 'indexing' || row.review_status !== 'approved'}
+              disabled={!canReindex(row)}
               loading={indexingId === row.id}
               onClick={() => void handleReindex(row)}
             >
               重新入库
             </Button>
-            {/* 下线：删除向量切片；仅在非入库中时允许（入库中会与后台任务冲突） */}
+            {/* 下线：删除向量切片；正常入库中禁用（会与后台任务冲突），僵死时同样放行 */}
             <Popconfirm
               title="确认下线该文档？"
               description="将删除其全部向量切片，不再参与检索；可再次入库。"
@@ -399,7 +486,7 @@ export default function AdminPage() {
               <Button
                 size="small"
                 icon={<StopOutlined />}
-                disabled={row.status === 'indexing'}
+                disabled={!canUnpublish(row)}
               >
                 下线
               </Button>
@@ -438,9 +525,15 @@ export default function AdminPage() {
               审核用户提交的 Word / Markdown 文档；通过后进入入库流程（P3 功能2）
             </Typography.Text>
           </div>
-          <Button icon={<ArrowLeftOutlined />} onClick={handleBackToChat}>
-            返回对话
-          </Button>
+          <Space>
+            {/* P6-F2：答案反馈评估（好评率 / 点踩归因 / 最近差评） */}
+            <Button icon={<BarChartOutlined />} onClick={() => setFeedbackOpen(true)}>
+              反馈评估
+            </Button>
+            <Button icon={<ArrowLeftOutlined />} onClick={handleBackToChat}>
+              返回对话
+            </Button>
+          </Space>
         </div>
 
         {/* 筛选区：审核结论切换 + 文件名搜索 + 手动刷新 */}
@@ -500,6 +593,57 @@ export default function AdminPage() {
           <Typography.Text type="secondary">正在加载预览…</Typography.Text>
         ) : preview ? (
           <>
+            {/* P5：图片/音频/视频直接展示原文件（浏览器原生标签流式加载，不读进 JS 内存） */}
+            {MEDIA_TYPES.includes(preview.file_type) && (
+              <div style={{ marginBottom: 16 }}>
+                {preview.file_type === 'image' && (
+                  <img
+                    src={adminDocumentMediaUrl(preview.id)}
+                    alt={preview.filename}
+                    style={{
+                      maxWidth: '100%',
+                      borderRadius: 8,
+                      border: '1px solid #f0f0f0',
+                      display: 'block',
+                    }}
+                  />
+                )}
+                {preview.file_type === 'audio' && (
+                  <audio controls src={adminDocumentMediaUrl(preview.id)} style={{ width: '100%' }} />
+                )}
+                {preview.file_type === 'video' && (
+                  <video
+                    controls
+                    src={adminDocumentMediaUrl(preview.id)}
+                    style={{ width: '100%', borderRadius: 8, background: '#000' }}
+                  />
+                )}
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  原文件可直接查看/播放；下方为 OCR/ASR 解析出的文本（入库后参与检索）。
+                </Typography.Text>
+              </div>
+            )}
+
+            {/* P5：解析元信息——让管理员判断「这一条是怎么被识别的、质量如何」 */}
+            {preview.extract_meta && (
+              <Space size={6} wrap style={{ marginBottom: 12 }}>
+                {preview.extract_meta.model && (
+                  <Tag color="purple">模型 {preview.extract_meta.model}</Tag>
+                )}
+                {formatDuration(preview.extract_meta.duration_seconds) && (
+                  <Tag>时长 {formatDuration(preview.extract_meta.duration_seconds)}</Tag>
+                )}
+                {typeof preview.extract_meta.chars === 'number' && (
+                  <Tag>识别 {preview.extract_meta.chars} 字</Tag>
+                )}
+                {typeof preview.extract_meta.elapsed_ms === 'number' && (
+                  <Tag>耗时 {(preview.extract_meta.elapsed_ms / 1000).toFixed(1)}s</Tag>
+                )}
+                {typeof preview.extract_meta.segments === 'number' &&
+                  preview.extract_meta.segments > 1 && <Tag>{preview.extract_meta.segments} 段转写</Tag>}
+              </Space>
+            )}
+
             {/* 不可预览（旧版 .doc / 文件损坏）时给出明确提示 */}
             {!preview.previewable && (
               <Typography.Text type="warning">{preview.text}</Typography.Text>
@@ -555,6 +699,9 @@ export default function AdminPage() {
           onChange={(e) => setRejectNote(e.target.value)}
         />
       </Modal>
+
+      {/* P6-F2：答案反馈评估抽屉（好评率 / 归因分布 / 最近差评明细） */}
+      <FeedbackSummaryDrawer open={feedbackOpen} onClose={() => setFeedbackOpen(false)} />
     </div>
   );
 }

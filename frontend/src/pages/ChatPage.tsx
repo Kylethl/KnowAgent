@@ -86,12 +86,19 @@ const [uploadOpen, setUploadOpen] = useState(false);
       try {
         const detail = await getConversation(id);
         setActiveId(id);
-        // 把后端历史映射为前端 ChatMessage（createdAt 由 ISO 时间解析为毫秒时间戳）
+        // 把后端历史映射为前端 ChatMessage（createdAt 由 ISO 时间解析为毫秒时间戳）。
+        // P4-F2：一并带上 citations —— 历史回答同样要能回看引用来源，
+        //        否则「刷新后引用卡片消失」会让人以为引用只在当次会话有效。
+        // P6-F2：带上 serverId（历史消息的 id 本身就是后端主键）与 feedback，
+        //        使用户回到旧会话时仍能看到自己点过的赞/踩，并可继续修改。
         const history: ChatMessage[] = detail.messages.map((m) => ({
           id: m.id,
           role: m.role,
           content: m.content,
           createdAt: Date.parse(m.created_at) || Date.now(),
+          citations: m.citations ?? [],
+          serverId: m.id,
+          feedback: m.feedback ?? null,
         }));
         loadMessages(history);
       } catch (err) {

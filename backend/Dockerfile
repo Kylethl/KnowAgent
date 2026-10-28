@@ -13,6 +13,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 1) 先复制依赖清单并安装（利用 Docker 层缓存：依赖不变则无需重装）
+#    P5 起 requirements.txt 含 imageio-ffmpeg：镜像内自带静态 ffmpeg，
+#    用于视频提取音轨与长音频切片，无需在镜像里 apt 安装数百 MB 的系统 ffmpeg。
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

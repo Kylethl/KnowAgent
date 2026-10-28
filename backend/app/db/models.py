@@ -1,7 +1,14 @@
-# ORM 模型（P1-DB1 / P1-DB2）：users / conversations / messages / documents
+# ORM 模型（P1-DB1 / P1-DB2 / P3-DB2 / P6-DB1 / P6-DB2）
 # ---------------------------------------------------------------------
-# 与 backend/sql/001_p1_db1_schema.sql、002_p1_db2_documents.sql 字段一一对应；
+# 与 backend/sql/ 下的建表脚本字段一一对应；
 # 该 SQL 文件为「建表规范源头」，本文件仅用于应用层读写。
+#
+# 表清单：
+#   users / conversations / messages（001）
+#   documents（002 + 003 审核字段 + 006 多模态解析字段）
+#   document_chunks（004，pgvector 向量）
+#   notifications（007，P6 审核通知）
+#   feedback（008，P6 答案反馈）
 #
 # 约定：
 #   - 主键 UUID 默认由 PG 内置 gen_random_uuid() 生成（server_default）。
@@ -147,8 +154,11 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     # 令牌数，上下文窗口管理（P2）用
     token_count: Mapped[Optional[int]] = mapped_column(Integer)
-    # P4：引用来源 [{doc_id, chunk, snippet}]
-    citations: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # P4：引用来源 [{index, doc_id, chunk_id, doc_title, snippet, ...}]
+    # none_as_null=True：写 None 时落 SQL NULL 而不是 JSON 'null'，
+    # 这样「未启用检索」(NULL) 与「检索了但无引用」([]) 在 SQL 层也能区分，
+    # 便于后续统计/清洗（WHERE citations IS NULL 才有意义）。
+    citations: Mapped[Optional[dict]] = mapped_column(JSONB(none_as_null=True))
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -228,6 +238,19 @@ class Document(Base):
     indexed_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
     # 最近一次入库失败原因；成功入库后置空（管理员据此排查「入库失败」）
     last_index_error: Mapped[Optional[str]] = mapped_column(Text)
+    # P4：入库时使用的向量模型签名（模型名，或未配置 Key 时的 "mock"）。
+    # 用于检测「向量已过期」：与当前配置不一致时提示重新入库，
+    # 否则 mock 向量 / 旧模型向量会在检索时召回无关内容（见 sql/005）。
+    embedding_model: Mapped[Optional[str]] = mapped_column(String(64))
+    # ---- P5 多模态解析字段 ----
+    # OCR / ASR 提取出的纯文本（图片=识别文字，音视频=转写文本）。
+    # 为什么要存：① 管理员审核时可直接查看「解析出了什么」，不必重新跑一遍模型；
+    #            ② 重入库失败时可对比新旧结果；③ 便于排查「入库了但检索不到」。
+    # 文档类（word / markdown）为空——它们的正文由解析器直接从原文件读取。
+    extracted_text: Mapped[Optional[str]] = mapped_column(Text)
+    # 解析元信息：{kind, provider, model, chars, elapsed_ms, duration_seconds, segments, extractor}
+    # none_as_null=True 的语义同 messages.citations：写 None 落 SQL NULL 而非 JSON null。
+    extract_meta: Mapped[Optional[dict]] = mapped_column(JSONB(none_as_null=True))
 
     created_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -348,4 +371,164 @@ Index(
     DocumentChunk.__table__.c.embedding,
     postgresql_using="hnsw",
     postgresql_ops={"embedding": "vector_cosine_ops"},
+)
+
+
+# =====================================================================
+# P6 运营闭环：站内信（审核通知）+ 答案反馈
+# ---------------------------------------------------------------------
+# 对应 sql/007_p6_notifications.sql 与 sql/008_p6_feedback.sql。
+# 两张表的取舍说明都写在各自的 SQL 文件头部，这里只补充字段与关系的映射。
+# =====================================================================
+
+
+class Notification(Base):
+    """站内信 / 通知表（P6-DB1）：把「审核结果」主动推给提交人。
+
+    业务背景（《需求清单》P6 功能1「审核通知」）：
+        用户在 P1 提交文档后只能自己反复打开「我的文档」看状态，
+        管理员审核完也不会通知到人。本表即「状态变更 → 通知」的落地存储，
+        前端通过轮询未读数在顶栏铃铛上呈现，并对新通知弹出 Toast。
+
+    为什么正文存快照（title/content）而不是渲染时查文档：
+        文档可能被改名、被下线甚至被清理，历史通知不应随之变形——
+        通知描述的是「当时发生了什么」，属于事实记录。
+    """
+
+    __tablename__ = "notifications"
+
+    # 通知主键
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    # 收件人：通知必须有人可收；用户注销时其通知级联清理
+    user_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 通知类型：document_approved（通过）/ document_rejected（驳回）
+    # 与 SQL 的 CHECK 约束一致（见下方 append_constraint）
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 标题：一句话结论（Toast 标题 / 列表主文案）
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 正文：含文件名、驳回理由等细节（列表展开可见）
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 关联文档：便于前端「点通知定位到我的文档」；文档被清理时置空，通知保留
+    doc_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # 已读时间：NULL=未读。用时间戳而非布尔值，可额外统计「多久才被查看」
+    read_at: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Notification id={self.id} user_id={self.user_id} "
+            f"type={self.type!r} read={self.read_at is not None}>"
+        )
+
+
+# 通知类型取值约束：与 007 SQL 的 CHECK 保持一致，保证 create_all 生成等价结构
+Notification.__table__.append_constraint(
+    CheckConstraint(
+        Notification.__table__.c.type.in_(["document_approved", "document_rejected"]),
+        name="ck_notifications_type",
+    )
+)
+# 列表查询索引：收件人 + 时间倒序（与 007 SQL 同名，二者任一先建都不会重复）
+Index(
+    "idx_notifications_user_created",
+    Notification.__table__.c.user_id,
+    Notification.__table__.c.created_at.desc(),
+)
+
+
+class Feedback(Base):
+    """答案反馈表（P6-DB2）：用户对某条助手回答的点赞 / 点踩。
+
+    业务背景（《需求清单》P6 功能2「答案反馈与评估」）：
+        「反馈采集用于后续 prompt/检索离线优化」——因此反馈必须挂在**具体回答**上，
+        并带上点踩归因（reason），才能回答「哪类问题答不好」而不只是「有几个差评」。
+
+    一条记录 = 一个用户对一条回答的一次评价：
+        (message_id, user_id) 唯一，重复提交视为修改（先赞后踩很常见），
+        不会堆出两条互相矛盾的记录。
+    """
+
+    __tablename__ = "feedback"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    # 被评价的消息：必须是助手回答（由 service 层校验 role='assistant'）
+    message_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # 评价人：用户注销后置空，反馈作为匿名评价保留（统计口径不因用户离开而失真）
+    user_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # 评价结论：up / down
+    rating: Mapped[str] = mapped_column(String(8), nullable=False)
+    # 点踩归因：off_topic / wrong / unsupported / other（点赞时为空）
+    reason: Mapped[Optional[str]] = mapped_column(String(32))
+    # 用户补充说明（自由文本，可空；长度在 service 层校验）
+    comment: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Feedback id={self.id} message_id={self.message_id} "
+            f"rating={self.rating!r}>"
+        )
+
+
+# 评价结论取值约束：与 008 SQL 的 ck 命名保持一致
+Feedback.__table__.append_constraint(
+    CheckConstraint(
+        Feedback.__table__.c.rating.in_(["up", "down"]),
+        name="ck_feedback_rating",
+    )
+)
+# 点踩归因取值约束（允许 NULL：点赞时没有归因）
+Feedback.__table__.append_constraint(
+    CheckConstraint(
+        Feedback.__table__.c.reason.is_(None)
+        | Feedback.__table__.c.reason.in_(["off_topic", "wrong", "unsupported", "other"]),
+        name="ck_feedback_reason",
+    )
+)
+# 唯一约束：同一用户对同一条回答只有一条反馈
+Index(
+    "uq_feedback_message_user",
+    Feedback.__table__.c.message_id,
+    Feedback.__table__.c.user_id,
+    unique=True,
+)
+# 管理员差评列表索引：按评价结论 + 时间倒序
+Index(
+    "idx_feedback_rating_created",
+    Feedback.__table__.c.rating,
+    Feedback.__table__.c.created_at.desc(),
 )

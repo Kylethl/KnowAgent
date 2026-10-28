@@ -1,30 +1,55 @@
 import type { DocType, DocumentRecord } from '../types';
 import { getToken, triggerUnauthorized } from './http';
 
-// P1-F3：文档上传服务
-// 职责：把用户选择的 Word / Markdown 文件以 multipart/form-data 上传到后端，
-//      并实时回传上传进度、成功回执与失败原因。
+// P1-F3 / P5-F1：文档上传服务
+// 职责：把用户选择的 Word / Markdown / 图片 / 音频 / 视频文件以 multipart/form-data
+//      上传到后端，并实时回传上传进度、成功回执与失败原因。
 //
 // 为什么不用 fetch / EventSource：
 //   - fetch 至今无法监听「请求体发送进度」，拿不到上传百分比；
 //   - 需求明确要求「显示上传进度」，因此这里用 XMLHttpRequest（xhr.upload.onprogress）。
-//   这是上传场景的唯一选择，与对话流的 SSE（EventSource）互不冲突。
 //
-// 后端契约（对应 P1-B2，本任务为前端，接口尚未实现）：
+// 后端契约（P1-B2 / P5-B1）：
 //   POST /documents/upload   Content-Type: multipart/form-data
-//   字段：file（必填，原始文件）、type（word/markdown，便于后端二次校验）
-//   成功 200（字段名与 documents 表 / Document ORM 一致，不做驼峰转换）：
-//     { id, filename, file_type, status, size_bytes, original_path, mime_type, created_at }
+//   字段：file（必填，原始文件）、type（word/markdown/image/audio/video，便于后端二次校验）
+//   成功 201：{ id, filename, type, status, size, storage_path, created_at }
 //   失败：FastAPI 默认形如 { "detail": "错误信息" }
 
-// 允许上传的扩展名白名单（小写比较）
-// 严格遵循《需求清单》P1 功能2：仅 Word（.doc/.docx）与 Markdown（.md）
-export const ALLOWED_EXTENSIONS: readonly string[] = ['.doc', '.docx', '.md'];
+// P5：扩展名白名单**按类型分组**。
+// 后端 services/media_types.py 中的 EXTENSION_TO_TYPE 是唯一真源，两边必须保持一致；
+// 分组的意义在于「一个类型一个大小上限」，而不是所有文件共用一个 20MB。
+export const EXTENSIONS_BY_TYPE: Record<DocType, readonly string[]> = {
+  word: ['.doc', '.docx'],
+  markdown: ['.md'],
+  image: ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'],
+  audio: ['.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'],
+  video: ['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm'],
+};
 
-// 单个文件大小上限（MB）
-// 说明：后端 P1-B2 会做同样的校验（防止绕过前端直接打接口），
-//      这里保持一致可在上传前就拦下大文件，省掉一次无效传输。
-export const MAX_FILE_SIZE_MB = 20;
+// 所有允许的扩展名（用于 <input accept> 与展示文案）
+export const ALLOWED_EXTENSIONS: readonly string[] = Object.values(EXTENSIONS_BY_TYPE).flat();
+
+// 各类型单文件大小上限（MB）：与后端 config.MAX_UPLOAD_SIZE / MAX_IMAGE_SIZE /
+// MAX_AUDIO_SIZE / MAX_VIDEO_SIZE 保持一致，避免「前端放行、后端 413」的糟糕体验。
+export const MAX_SIZE_MB_BY_TYPE: Record<DocType, number> = {
+  word: 20,
+  markdown: 20,
+  image: 10,
+  audio: 50,
+  video: 200,
+};
+
+// 类型展示名（用于错误提示，避免用户看到英文类型名）
+const TYPE_LABEL: Record<DocType, string> = {
+  word: 'Word',
+  markdown: 'Markdown',
+  image: '图片',
+  audio: '音频',
+  video: '视频',
+};
+
+// 兼容旧引用的默认上限（文档类）；媒体类请用 maxSizeMbFor()
+export const MAX_FILE_SIZE_MB = MAX_SIZE_MB_BY_TYPE.word;
 
 // 单批次最多选择的文件数量：防止一次拖入上百个文件把浏览器与后端打满
 export const MAX_FILES_PER_BATCH = 10;
@@ -59,9 +84,19 @@ export interface UploadHandlers {
  */
 export function resolveDocType(filename: string): DocType | null {
   const lower = filename.toLowerCase();
-  if (lower.endsWith('.doc') || lower.endsWith('.docx')) return 'word';
-  if (lower.endsWith('.md')) return 'markdown';
+  // 按类型分组匹配：顺序无关，且新增类型只需改 EXTENSIONS_BY_TYPE
+  for (const [type, exts] of Object.entries(EXTENSIONS_BY_TYPE) as [DocType, readonly string[]][]) {
+    if (exts.some((ext) => lower.endsWith(ext))) return type;
+  }
   return null;
+}
+
+/**
+ * 按类型取单文件大小上限（MB）
+ * @param type 文档类型
+ */
+export function maxSizeMbFor(type: DocType): number {
+  return MAX_SIZE_MB_BY_TYPE[type] ?? MAX_FILE_SIZE_MB;
 }
 
 /**
@@ -75,7 +110,7 @@ export function isAllowedExtension(filename: string): boolean {
 
 /**
  * 上传前校验单个文件
- * 校验项：格式白名单 → 文件大小 → 空文件 → 同名重复
+ * 校验项：格式白名单 → 类型推导 → 该类型的大小上限 → 空文件 → 同名重复
  * @param file 待校验的文件
  * @param existingNames 队列中已有的文件名（用于去重）
  * @returns 错误文案；校验通过返回 null
@@ -84,13 +119,15 @@ export function validateFile(
   file: File,
   existingNames: readonly string[]
 ): string | null {
-  // 1) 格式校验：P1 仅接受 Word / Markdown
-  if (!isAllowedExtension(file.name)) {
-    return `「${file.name}」格式不支持，仅可上传 .doc / .docx / .md`;
+  // 1) 格式校验：按扩展名白名单判定
+  const type = resolveDocType(file.name);
+  if (!type) {
+    return `「${file.name}」格式不支持，仅可上传 ${ALLOWED_EXTENSIONS.join(' / ')}`;
   }
-  // 2) 大小校验：与后端 MAX_FILE_SIZE_MB 保持一致的上限
-  if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
-    return `「${file.name}」超过 ${MAX_FILE_SIZE_MB}MB 上限（实际 ${formatFileSize(file.size)}）`;
+  // 2) 大小校验：按类型取上限（图片 10MB / 音频 50MB / 视频 200MB / 文档 20MB）
+  const limitMb = maxSizeMbFor(type);
+  if (file.size > limitMb * 1024 * 1024) {
+    return `「${file.name}」超过${TYPE_LABEL[type]} ${limitMb}MB 上限（实际 ${formatFileSize(file.size)}）`;
   }
   // 3) 空文件：0 字节文件没有入库价值，且会让后端解析阶段报错
   if (file.size === 0) {
@@ -207,9 +244,9 @@ function parseErrorMessage(xhr: XMLHttpRequest): string {
     triggerUnauthorized();
     return '登录已失效，请重新登录';
   }
-  if (xhr.status === 404) return '上传接口不存在，后端 P1-B2 尚未实现';
-  if (xhr.status === 413) return `文件过大，超过服务端 ${MAX_FILE_SIZE_MB}MB 限制`;
-  if (xhr.status === 415) return '服务端拒绝了该文件格式';
+  if (xhr.status === 404) return '上传接口不存在，请确认后端服务版本';
+  if (xhr.status === 413) return '文件过大，超过服务端对该类型的大小限制';
+  if (xhr.status === 415) return '服务端拒绝了该文件格式（或文件内容与扩展名不符）';
   if (xhr.status === 0) return '无法连接服务器，请检查后端是否已启动';
   return `上传失败（HTTP ${xhr.status}）`;
 }

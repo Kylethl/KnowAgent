@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from io import BytesIO
+import re
 from typing import List
 
 from ..core.logging import get_logger
@@ -184,12 +185,53 @@ def parse_docx(content: bytes) -> List[ParsedBlock]:
     return blocks
 
 
+def parse_extracted_text(text: str, heading: str = "") -> List[ParsedBlock]:
+    """把「多模态提取出的纯文本」整理为解析块（P5：OCR / ASR 结果的下游）。
+
+    为什么需要它：OCR/ASR 得到的是没有标题层级的连续文本，而切片器消费的是
+    ParsedBlock（heading + paragraphs）。这里做最小归一化：
+      - 空行分段：模型输出的段落边界通常由空行体现，直接按空行切成段落；
+      - 章节名统一：图片用「图片文字」、音视频用「语音转写」，写进 heading，
+        这样引用卡片能显示「来自图片/音频的哪一部分」，用户能分辨来源形态。
+
+    Args:
+        text: OCR/ASR 提取的原始文本。
+        heading: 该块所属的展示用章节名（如「图片文字」「语音转写」）。
+
+    Returns:
+        ParsedBlock 列表（通常只有一块，段落内保留换行）。
+
+    Raises:
+        DocumentParseError: 文本为空（无有效内容不应入库）。
+    """
+    # 统一换行符，避免 \r\n 造成段落切分异常
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        raise DocumentParseError("多模态解析结果为空，无法入库")
+
+    # 按「一个或多个空行」切分段落；段内单换行保留（OCR 常按行输出）
+    paragraphs: List[str] = []
+    for block in re.split(r"\n\s*\n+", normalized):
+        cleaned = block.strip()
+        if cleaned:
+            paragraphs.append(cleaned)
+
+    if not paragraphs:
+        raise DocumentParseError("多模态解析结果为空，无法入库")
+
+    return [
+        ParsedBlock(heading=heading, text="\n".join(paragraphs), paragraphs=paragraphs)
+    ]
+
+
 def parse_document(content: bytes, file_type: str) -> List[ParsedBlock]:
     """按文档类型解析为结构化文本块（解析入口）。
 
     Args:
         content: 原始文件字节。
-        file_type: 文档类型（'markdown' / 'word'；P5 扩展 image/audio/video）。
+        file_type: 文档类型（'markdown' / 'word'）。
+            图片/音频/视频不走本函数——它们的文本要先经 OCR/ASR 提取
+            （见 services/media_extract.py），再交给 parse_extracted_text。
 
     Returns:
         ParsedBlock 列表。
@@ -201,6 +243,11 @@ def parse_document(content: bytes, file_type: str) -> List[ParsedBlock]:
         blocks = parse_markdown(content)
     elif file_type == "word":
         blocks = parse_docx(content)
+    elif file_type in ("image", "audio", "video"):
+        # 明确区分「没接线」与「解析失败」：这类媒体必须先做 OCR/ASR
+        raise DocumentParseError(
+            f"{file_type} 类型需要先经 OCR/ASR 提取文本，不能直接由文本解析器处理"
+        )
     else:
         raise DocumentParseError(f"暂不支持解析该类型文档：{file_type}")
 

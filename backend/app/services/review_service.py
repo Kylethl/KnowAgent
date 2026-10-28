@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..core.errors import DocumentNotFound, ReviewNotAllowed
 from ..core.logging import get_logger
 from ..db.models import Document, User
+from ..services import notification_service
 from ..services import storage as storage_mod
 
 logger = get_logger(__name__)
@@ -171,6 +172,9 @@ async def review_document(
 ) -> Document:
     """执行一次审核动作（通过 / 驳回），并落定审核结论与生命周期状态。
 
+    P6-B1 联动：审核结论落定的同时生成站内信（见 notification_service），
+    与审核字段同一事务提交——提交人下次轮询未读数时即可看到结果。
+
     校验顺序（先便宜后昂贵，先安全后写入）：
       1. 动作取值必须合法；
       2. 已通过的文档是终态，不允许重复审核或驳回；
@@ -209,6 +213,18 @@ async def review_document(
     # 通过时备注可选（可留空）；驳回时上面已保证非空
     doc.review_note = clean_note or None
     doc.reviewed_at = datetime.now(timezone.utc)
+
+    # 5) P6-B1：生成站内信（审核结果通知）。
+    #    注意：这里只是 db.add，**不单独 commit** —— 通知与审核字段在同一事务提交，
+    #    保证「审核结论」与「用户收到的通知」同生共死，不会出现
+    #    「文档已通过但提交人始终收不到通知」的静默不一致。
+    #    收件人为空（匿名提交）时服务内部会直接跳过并返回 None。
+    try:
+        await notification_service.create_review_notification(db, doc, action)
+    except ValueError as exc:
+        # 动作非法理论上已被上面拦截，这里仅防御性兜底：
+        # 通知生成失败不应让审核动作白白回滚（用户仍能看到状态变化）
+        logger.error("生成审核通知失败（不影响审核结果）：doc=%s，原因=%s", doc.id, exc)
 
     await db.commit()
     await db.refresh(doc)
@@ -251,8 +267,9 @@ def _extract_text_from_bytes(content: bytes, file_type: str) -> str:
             logger.warning("Word 文档预览解析失败（可能是 .doc 旧格式或文件损坏）")
             return "（该文件为旧版 .doc 二进制格式或已损坏，无法在线预览，请下载后查看）"
 
-    # 其余类型（P5 的 image/audio/video）本阶段不支持文本预览
-    return f"（暂不支持预览 {file_type} 类型文件）"
+    # 其余类型（P5 的 image/audio/video）不通过字节解析：它们的文本由 OCR/ASR 产生，
+    # 见 preview_document 中的媒体分支（直接读 documents.extracted_text，不再解原文件）
+    return f"（{file_type} 类型需经 OCR/ASR 解析后查看文本，见「解析结果」）"
 
 
 async def preview_document(
@@ -260,27 +277,42 @@ async def preview_document(
     doc: Document,
     max_chars: int = PREVIEW_MAX_CHARS,
 ) -> Tuple[str, bool]:
-    """生成文档的文本预览内容（管理员审核时快速判断文档质量）。
+    """生成文档的预览内容（管理员审核时快速判断文档质量）。
+
+    分两条路径：
+      - 图片/音频/视频：不回读原始文件（视频可达 200MB），直接返回上一次 OCR/ASR
+        的结果；尚未解析时给出可读提示，管理员仍可通过「播放/查看原文件」判断；
+      - 文档：读取原始文件并按类型提取纯文本（原有逻辑）。
 
     Args:
         storage: 存储后端实例（用于读取原始文件字节）。
-        doc: 文档对象（提供 original_path 与 file_type）。
+        doc: 文档对象（提供 original_path / file_type / extracted_text）。
         max_chars: 预览最大字符数，超出截断。
 
     Returns:
-        (text, truncated) 二元组：
-          text 为预览文本（已截断则 truncated=True）。
+        (text, truncated) 二元组：text 为预览文本（已截断则 truncated=True）。
 
     Raises:
-        storage_mod.StorageError: 原始文件读取失败（如对象已被清理）。
+        storage_mod.StorageError: 原始文件读取失败（仅文档类会读文件）。
     """
-    # 1) 从对象存储读取原始字节
+    # 1) 多模态：优先展示已提取的文本（审核时最能说明「这条知识讲了什么」）
+    if doc.file_type in ("image", "audio", "video"):
+        extracted = (doc.extracted_text or "").strip()
+        if extracted:
+            return (extracted[:max_chars], len(extracted) > max_chars)
+        return (
+            "（该文件为图片/音视频，尚未完成 OCR/ASR 解析。"
+            "审核通过并入库后，可在此查看解析出的文字/转写文本。）",
+            False,
+        )
+
+    # 2) 文档：从对象存储读取原始字节后解析
     content = await storage.get_object(doc.original_path)
 
-    # 2) 按类型提取纯文本
+    # 3) 按类型提取纯文本
     text = _extract_text_from_bytes(content, doc.file_type)
 
-    # 3) 截断保护：超长文本只返回前 max_chars 字符，并明确告知前端已截断
+    # 4) 截断保护：超长文本只返回前 max_chars 字符，并明确告知前端已截断
     if len(text) > max_chars:
         return text[:max_chars], True
     return text, False

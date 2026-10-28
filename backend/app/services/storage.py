@@ -82,6 +82,43 @@ class BaseStorage(ABC):
         """
         raise NotImplementedError
 
+    # ------------------------------------------------------------------
+    # P5：大文件（音视频）支持 —— 以下两个方法提供**非抽象**默认实现，
+    # 既保持与既有实现的兼容（老代码/测试桩无需改动），又允许具体后端覆盖为流式，
+    # 避免 200MB 视频被整体读进内存。
+    # ------------------------------------------------------------------
+
+    async def put_object_from_path(self, key: str, path, content_type: str | None) -> None:
+        """把**磁盘上的临时文件**写入对象存储（大文件推荐路径）。
+
+        默认实现退化为「读入内存再写入」，具体后端应覆盖为流式拷贝/上传。
+
+        Args:
+            key: 相对对象键。
+            path: 本地临时文件路径（Path 或 str）。
+            content_type: MIME 类型。
+        """
+        from pathlib import Path as _Path
+
+        data = await asyncio.to_thread(_Path(path).read_bytes)
+        await self.put_object(key, data, content_type)
+
+    async def iter_object(self, key: str, chunk_size: int = 1024 * 1024):
+        """流式读取对象内容（媒体预览/播放用，避免整段载入内存）。
+
+        默认实现退化为一次性读取后分块 yield。
+
+        Args:
+            key: 相对对象键。
+            chunk_size: 每次产出的字节数。
+
+        Yields:
+            对象内容的字节块。
+        """
+        data = await self.get_object(key)
+        for start in range(0, len(data), chunk_size):
+            yield data[start : start + chunk_size]
+
 
 class LocalStorage(BaseStorage):
     """本地目录存储（开发默认，零依赖）。
@@ -151,6 +188,54 @@ class LocalStorage(BaseStorage):
         except OSError as exc:
             raise StorageError(f"本地文件删除失败：{exc}") from exc
         logger.debug("LocalStorage 删除完成：%s", target)
+
+    async def put_object_from_path(self, key: str, path, content_type: str | None) -> None:
+        """流式拷贝本地临时文件到落盘目录（P5 大文件上传路径）。
+
+        与 put_object 一样采用「临时文件 + 原子替换」，保证读取方永远看不到半截文件；
+        区别是不把整个文件读进内存，200MB 视频也只占用固定大小的缓冲区。
+
+        Args:
+            key: 相对对象键。
+            path: 源临时文件路径。
+            content_type: MIME 类型（本地存储不落元数据，仅为接口一致）。
+        """
+        import shutil
+
+        target = self.root / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(target.suffix + ".tmp")
+
+        def _copy() -> None:
+            with open(path, "rb") as src, open(tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            tmp.replace(target)  # 原子替换
+
+        try:
+            await asyncio.to_thread(_copy)
+        except OSError as exc:
+            raise StorageError(f"本地文件写入失败：{exc}") from exc
+        logger.debug("LocalStorage 流式写入成功：%s", target)
+
+    async def iter_object(self, key: str, chunk_size: int = 1024 * 1024):
+        """按块读取本地文件（媒体预览/播放用）。"""
+        target = (self.root / key).resolve()
+        root = self.root.resolve()
+        # 路径穿越防护：与 get_object 保持同一套校验
+        if not (target == root or root in target.parents):
+            raise StorageError(f"非法的对象键：{key}", status_code=400)
+        if not target.exists():
+            raise StorageError(f"对象不存在：{key}", status_code=404)
+
+        handle = await asyncio.to_thread(open, target, "rb")
+        try:
+            while True:
+                chunk = await asyncio.to_thread(handle.read, chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            await asyncio.to_thread(handle.close)
 
 
 class MinioStorage(BaseStorage):
@@ -245,6 +330,45 @@ class MinioStorage(BaseStorage):
         except Exception as exc:
             raise StorageError(f"MinIO 对象删除失败：{exc}") from exc
         logger.debug("MinioStorage 删除完成：bucket=%s，key=%s", self.bucket, key)
+
+    async def put_object_from_path(self, key: str, path, content_type: str | None) -> None:
+        """用 SDK 的 fput_object 直接上传磁盘文件（P5 大文件路径，不占内存）。"""
+
+        def _fput() -> None:
+            self._client.fput_object(
+                self.bucket,
+                key,
+                str(path),
+                content_type=content_type or "application/octet-stream",
+            )
+
+        try:
+            await asyncio.to_thread(_fput)
+        except Exception as exc:
+            raise StorageError(f"MinIO 对象写入失败：{exc}") from exc
+        logger.debug("MinioStorage 流式写入成功：bucket=%s，key=%s", self.bucket, key)
+
+    async def iter_object(self, key: str, chunk_size: int = 1024 * 1024):
+        """按块读取 MinIO 对象（媒体预览/播放用）。"""
+
+        def _open():
+            return self._client.get_object(self.bucket, key)
+
+        try:
+            resp = await asyncio.to_thread(_open)
+        except Exception as exc:
+            raise StorageError(f"MinIO 对象读取失败：{exc}") from exc
+
+        try:
+            while True:
+                chunk = await asyncio.to_thread(resp.read, chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            # 释放连接：否则连接池会被长视频播放长期占住
+            await asyncio.to_thread(resp.close)
+            await asyncio.to_thread(resp.release_conn)
 
 
 def build_object_key(scope: str | None, ext: str) -> str:

@@ -27,6 +27,23 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def stub_retrieval(monkeypatch):
+    """P4：隔离真实知识库检索。
+
+    说明：/chat 在 P4 起会先做向量检索再生成；若不隔离，
+    本文件的接口契约用例会真实调用 embedding 接口并依赖数据库/向量库，
+    既慢又不稳定（违背「AI 调用一律 mock」原则）。
+    这里统一返回 disabled，等价于「未启用检索」，使被测行为回到 P1/P2 外观。
+    """
+    from app.services.retriever import MODE_DISABLED, RetrievalResult
+
+    async def _fake_retrieval(query, db):
+        return RetrievalResult(mode=MODE_DISABLED, reason="测试环境未启用检索")
+
+    monkeypatch.setattr(chat_module, "retrieve_for_chat", _fake_retrieval)
+
+
 @pytest.fixture()
 def fake_stream(monkeypatch):
     """替换真实的 LangChain 调用链：按固定分片产出文本，并记录收到的入参。
@@ -38,7 +55,7 @@ def fake_stream(monkeypatch):
 
     # 签名需与真实 stream_answer 对齐：P2 起多出 memory_enabled 开关
     # （持久化路径传 False，表示历史由数据库注入、不读写内存记忆）。
-    async def _fake(message, conversation_id=None, history=None, meta=None, memory_enabled=True):
+    async def _fake(message, conversation_id=None, history=None, meta=None, memory_enabled=True, context=None):
         captured.append(
             {
                 "message": message,
@@ -186,7 +203,7 @@ def test_chat_reports_error_in_stream(client, monkeypatch):
     """链路报错时不应中断连接，而应在流内给出可读提示并正常收尾。"""
     from app.core.errors import LLMNotConfiguredError
 
-    async def _raise(message, conversation_id=None, history=None, meta=None, memory_enabled=True):
+    async def _raise(message, conversation_id=None, history=None, meta=None, memory_enabled=True, context=None):
         raise LLMNotConfiguredError("DeepSeek API Key 未配置")
         yield  # pragma: no cover —— 仅为让函数成为生成器
 
@@ -202,7 +219,7 @@ def test_chat_reports_error_in_stream(client, monkeypatch):
 def test_chat_warns_when_truncated(client, monkeypatch):
     """回答被 max_tokens 截断时，应追加可读的截断提示（否则用户无法分辨「答完」与「截断」）。"""
 
-    async def _truncated(message, conversation_id=None, history=None, meta=None, memory_enabled=True):
+    async def _truncated(message, conversation_id=None, history=None, meta=None, memory_enabled=True, context=None):
         if isinstance(meta, dict):
             meta["finish_reason"] = "length"
         yield "半截回答"

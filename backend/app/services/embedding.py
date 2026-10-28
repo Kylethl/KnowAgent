@@ -319,3 +319,49 @@ async def embed_query(query: str) -> List[float]:
     """
     vectors = await embed_texts([query])
     return vectors[0]
+
+
+# =====================================================================
+# 向量模型签名与「向量已过期」判定（P4 功能1 遗留问题修复）
+# ---------------------------------------------------------------------
+# 为什么需要签名：
+#   向量只有在「同一模型、同一语义空间」内才能比较。以下两种情况会让库里
+#   的向量与当前查询向量不可比，检索结果等同于随机：
+#     1. 入库时未配置真实 Key → 写入的是 mock 伪向量；
+#     2. 入库后又更换了 embedding 模型。
+#   把「入库时用的模型」记在 documents.embedding_model 上，接口层比对即可提示重入库。
+# =====================================================================
+
+# mock 模式的签名标记：与真实模型名区分开，便于后台一眼看出「这是伪向量」
+MOCK_SIGNATURE = "mock"
+
+
+def current_embedding_signature() -> str:
+    """返回**当前配置**下会使用的向量模型签名。
+
+    Returns:
+        已配置真实 Key 时返回模型名（如 qwen3.7-text-embedding-flash）；
+        未配置（走 mock）时返回 "mock"。
+    """
+    settings = get_settings()
+    return settings.QWEN_EMBEDDING_MODEL if settings.is_qwen_configured else MOCK_SIGNATURE
+
+
+def embedding_is_stale(stored_signature: str | None) -> bool:
+    """判断某文档已入库的向量是否与当前配置「不可比」。
+
+    判定规则：
+      - 记录为空（历史数据未记录模型）→ 视为需要重新入库：
+        无法确认它用的是真实模型还是 mock，提示一次重入库即可自愈（代价很小）；
+      - 与当前签名一致 → 不过期；
+      - 不一致（mock ↔ 真实模型、或换了模型）→ 过期。
+
+    Args:
+        stored_signature: documents.embedding_model 的值。
+
+    Returns:
+        True 表示建议重新入库。
+    """
+    if not stored_signature:
+        return True
+    return stored_signature != current_embedding_signature()

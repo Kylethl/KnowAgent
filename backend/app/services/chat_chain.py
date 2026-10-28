@@ -15,6 +15,12 @@
 #     P2 落库后只需替换 langchain_memory.py 的存储后端即可复用本链路。
 #
 # 替换关系：接管 P1-B1 的 services/deepseek_client.stream_chat()。
+#
+# P4 扩展（RAG 检索增强）：
+#   本模块仍是**唯一的流式消费实现**——检索增强只是「换一条 Prompt 结构不同的链」，
+#   stream_answer(..., context=...) 为 None 时走通用链（P1/P2 行为不变），
+#   非 None 时走 services/rag_chain.py 的增强链（资料 + 引用规则进 system）。
+#   这样既满足《需求清单》「生成链（LangChain）」的要求，也避免流式逻辑被复制两份。
 
 from functools import lru_cache
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -28,6 +34,7 @@ from ..core.errors import DeepSeekError, LLMError, LLMNotConfiguredError
 from ..core.logging import get_logger
 from .langchain_memory import HistoryItem, dicts_to_messages, get_memory_store
 from .llm import get_chat_model
+from .rag_chain import compose_rag_system_prompt, get_rag_chain, normalize_context
 
 logger = get_logger(__name__)
 
@@ -36,7 +43,8 @@ def build_prompt() -> ChatPromptTemplate:
     """构造对话提示词模板。
 
     模板包含三段：
-      - system：人设与回答约束（P4 接入 RAG 后会在此追加「基于给定资料回答」等约束）；
+      - system：人设与回答约束（P4 的检索增强链在 services/rag_chain.py，
+        那里额外携带 【参考资料】 槽位与引用编号规则；本模板保持「无检索」形态）；
       - history：多轮历史占位，为空时自动留空（optional=True，避免空占位被某些模型拒绝）；
       - human：用户本轮提问。
 
@@ -77,6 +85,7 @@ async def stream_answer(
     history: Optional[List[HistoryItem]] = None,
     meta: Optional[dict] = None,
     memory_enabled: bool = True,
+    context: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """流式调用 DeepSeek 逐片段产出回答，并维护该会话的多轮记忆。
 
@@ -87,7 +96,9 @@ async def stream_answer(
            （读取 / 必要时注入客户端历史 / 写回本轮），保证「单会话多轮上下文」；
          - memory_enabled=False（P2 会话持久化）：历史由外部（数据库）注入，
            本函数不再读写内存记忆，避免「内存 + 数据库」双写导致上下文错乱；
-      3. 读出会话历史，与 system / question 一起喂给 LangChain 链；
+      3. 读出会话历史，与 system / question 一起喂给 LangChain 链：
+         - context 为 None（无检索，P1/P2 行为）→ 通用对话链；
+         - context 非 None（P4 检索增强）→ 增强链，资料与引用规则进入 system；
       4. 流式产出增量文本；同时把 finish_reason 写入 meta 供上层判断是否被截断；
       5. memory_enabled=True 时，正常结束后把本轮「用户提问 + 助手回答」写回记忆。
 
@@ -95,8 +106,11 @@ async def stream_answer(
         question: 用户本轮提问。
         conversation_id: 会话 ID；为空则使用默认会话（仅 memory_enabled=True 时生效）。
         history: 显式携带的历史（客户端注入或数据库加载）；memory_enabled=False 时作为唯一历史来源。
-        meta: 可选的可变字典，用于回传元信息（当前写入 finish_reason）。
+        meta: 可选的可变字典，用于回传元信息（当前写入 finish_reason 与 rag 标记）。
         memory_enabled: 是否启用 LangChain 内存记忆。P2 会话落库后应置 False，由数据库管理历史。
+        context: P4 检索增强用的参考资料文本。
+            None  表示本轮不启用检索（走 P1/P2 的通用链）；
+            空串  表示「检索已执行但无命中」，仍走增强链，由 Prompt 引导模型如实说明。
 
     Yields:
         模型增量输出的文本片段。
@@ -132,21 +146,38 @@ async def stream_answer(
         session_id = conversation_id or "db"
         history_messages = dicts_to_messages(history) if history else []
 
-    # 3) 组装本轮输入：历史 + system + 本轮提问
+    # 3) 组装本轮输入：P4 起按是否带上下文选择「通用链 / 增强链」
+    use_rag = context is not None
     inputs: Dict[str, Any] = {
-        "system_prompt": cfg.SYSTEM_PROMPT,
         "history": history_messages,
         "question": question,
     }
+    if use_rag:
+        # 增强链：人设 + 引用规则进 system，资料填 context 槽位（无资料时填占位文案）
+        inputs["system_prompt"] = compose_rag_system_prompt(cfg.SYSTEM_PROMPT)
+        inputs["context"] = normalize_context(context)
+        has_context = bool((context or "").strip())
+        if meta is not None:
+            # 供上层日志/前端区分「基于知识库作答」与「检索无命中后的通用回答」
+            meta["rag"] = True
+            meta["rag_has_context"] = has_context
+        chain = get_rag_chain()
+    else:
+        # 通用链：保持 P1 行为完全不变（RAG 关闭或降级时走这里）
+        inputs["system_prompt"] = cfg.SYSTEM_PROMPT
+        if meta is not None:
+            meta["rag"] = False
+        chain = get_chat_chain()
 
     logger.info(
-        "开始流式回答（LangChain 链）：conversation_id=%s，历史消息数=%d，memory_enabled=%s",
+        "开始流式回答（%s）：conversation_id=%s，历史消息数=%d，memory_enabled=%s，资料长度=%d",
+        "RAG 增强链" if use_rag else "通用链",
         session_id,
         len(history_messages),
         memory_enabled,
+        len(inputs.get("context", "")),
     )
 
-    chain = get_chat_chain()
     answer_parts: List[str] = []
 
     try:

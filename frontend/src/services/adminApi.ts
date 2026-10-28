@@ -1,4 +1,4 @@
-import { requestJson } from './http';
+import { API_PREFIX, getToken, requestJson } from './http';
 import type { AdminDocumentList, DocumentPreview, ReviewPayload, ReviewResultData, ReviewStatus } from '../types';
 
 // P3-F1：管理员审核接口
@@ -61,4 +61,21 @@ export async function reviewDocument(
  */
 export async function previewDocument(documentId: string): Promise<DocumentPreview> {
   return requestJson<DocumentPreview>(`/admin/documents/${documentId}/preview`);
+}
+
+/**
+ * 构造媒体原文件的访问地址（P5：图片/音频/视频预览）。
+ *
+ * 为什么返回 URL 而不是用 requestJson 取二进制：
+ *   浏览器要靠 `<img src>` / `<audio src>` / `<video src>` 才能直接展示和播放，
+ *   这些标签**无法携带 Authorization 头**，因此只能把令牌放进 query 参数
+ *   （与 /chat 的 SSE 传令牌同理，后端由 require_admin_media 兼容）。
+ *   同时浏览器会自行处理流式加载与播放，避免把 200MB 视频读进 JS 内存。
+ *
+ * @param documentId 文档 ID
+ * @returns 可直接用于媒体标签的完整地址（含 ?token=）
+ */
+export function adminDocumentMediaUrl(documentId: string): string {
+  const token = getToken() ?? '';
+  return `${API_PREFIX}/admin/documents/${documentId}/media?token=${encodeURIComponent(token)}`;
 }
