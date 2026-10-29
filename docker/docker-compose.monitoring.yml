@@ -1,0 +1,95 @@
+# 知识库问答网站 — 监控编排（P7-Dep1：Prometheus + Grafana + exporters）
+# ---------------------------------------------------------------------
+# 定位：生产监控的**覆盖文件**，与 docker-compose.yml 一起使用，不单独运行。
+#   docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+#
+# 拓扑：
+#   prometheus ──抓──> backend:/metrics（FastAPI 内置 Prometheus 指标）
+#                    └> postgres-exporter（转发 pg_stat_database 等）
+#                    └> redis-exporter（转发内存/键/命中率）
+#   grafana   ──读──> prometheus（数据源）
+#
+# 指标说明（后端内置，见 app/core/metrics.py）：
+#   knowagent_http_requests_total    按 method/path/status 统计的 HTTP 请求
+#   knowagent_http_request_duration_seconds  请求耗时直方图（分桶）
+#   knowagent_llm_tokens_total       LLM token 用量（input/output 分开）
+#   knowagent_llm_requests_total     LLM 调用次数（按模型/结果）
+#   knowagent_dependency_up          依赖健康（postgres/redis/deepseek/embedding/media）
+#   knowagent_rate_limit_rejected_total  限流拒绝次数
+#   knowagent_backup_total / _success  备份执行/成功计数
+#
+# 抓取保护：backend 若设置了 METRICS_TOKEN，这里 job 需在 bearer_token 里配置。
+#   默认不配置（内网部署常见）；公网暴露时务必开启，并在下方填写。
+
+services:
+  # ---------- Prometheus（指标采集 + 时序存储） ----------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: knowagent-prometheus
+    command:
+      # 数据保留 30 天 + 本地时序存储上限 20GB（超限自动淘汰最旧数据）
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.retention.size=20GB"
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-lifecycle"   # 允许热重载配置（POST /-/reload）
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+    # 生产建议：9090 不对公网开放，仅内网 / 经 nginx 反代带鉴权访问
+    restart: unless-stopped
+
+  # ---------- Grafana（可视化看板） ----------
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: knowagent-grafana
+    environment:
+      # 初始管理员（首次启动生效，之后改需在 UI 里改）
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # 关闭匿名访问，强制登录（生产必须）
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # 关闭注册，避免公网用户自建账号
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # 预置数据源（Prometheus）与看板（自动导入）
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ---------- PostgreSQL exporter（把 PG 内部指标转成 Prometheus 格式） ----------
+  # 说明：backend 的 /metrics 只暴露「应用级」指标（HTTP/LLM/依赖布尔）。
+  #       数据库的慢查询、连接数、缓存命中率、表膨胀需要 exporter 单独采集。
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: knowagent-postgres-exporter
+    environment:
+      # DATA_SOURCE_NAME 用 key=value 形式；口令含特殊字符时务必 URL 编码
+      DATA_SOURCE_NAME: postgresql://knowagent:knowagent@postgres:5432/knowagent?sslmode=disable
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  # ---------- Redis exporter（内存/键数量/命中率） ----------
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.60.0
+    container_name: knowagent-redis-exporter
+    command:
+      - "--redis.addr=redis://redis:6379"
+      # 只暴露通用指标，避免把敏感键名打出去
+      - "--check-keys="
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:

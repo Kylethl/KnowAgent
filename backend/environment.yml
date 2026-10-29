@@ -46,3 +46,7 @@ dependencies:
       # 多模态（P5）：图片送 OCR 前压缩；imageio-ffmpeg 附带静态 ffmpeg 用于视频提音轨/音频切片
       - Pillow>=10.0.0
       - imageio-ffmpeg>=0.5.0
+      # 监控与错误上报（P7）：Prometheus 指标 + Sentry 异常上报（均为可选依赖，缺失时自动降级）
+      - prometheus-client>=0.20
+      - sentry-sdk[fastapi]>=2.0
+

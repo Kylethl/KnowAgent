@@ -294,8 +294,119 @@ class Settings(BaseSettings):
     # 置空字符串表示不区分队列（全部走默认队列），便于小规模部署。
     CELERY_MEDIA_QUEUE: str = "media"
 
-    # ---------- 日志 ----------
+    # =================================================================
+    # P7 生产加固 — 功能1：监控 / 日志 / 备份
+    # -----------------------------------------------------------------
+    # 全部开关集中在此，便于按环境（开发 / 预发 / 生产 / 私有化）差异化配置，
+    # 业务代码只读配置、不写死任何阈值。
+    # =================================================================
+
+    # ---------- 结构化日志（P7-B1） ----------
+    # 日志级别：DEBUG / INFO / WARNING / ERROR
     LOG_LEVEL: str = "INFO"
+    # 日志格式：text（人类可读，本地开发）/ json（单行 JSON，生产采集用）
+    LOG_FORMAT: str = "text"
+    # 日志文件路径：留空表示只输出到 stdout（容器内推荐，交给 docker/fluentd 收集）。
+    # 非空时额外写文件并按 LOG_MAX_BYTES 轮转（非容器部署时可落盘备查）。
+    LOG_FILE: str = ""
+    # 单个日志文件大小上限（字节）与保留的历史文件数
+    LOG_MAX_BYTES: int = 20 * 1024 * 1024
+    LOG_BACKUP_COUNT: int = 10
+    # 是否输出访问日志（每个 HTTP 请求一行：方法/路径/状态/耗时/request_id）。
+    # 关闭后仍保留错误日志，仅减少噪声（高频健康检查场景可关）。
+    ACCESS_LOG_ENABLED: bool = True
+    # 访问日志中是否包含 query string。默认 False：
+    #   SSE 的 /chat 用 ?token= 传令牌，把 query 打进日志等于把令牌写进日志文件。
+    ACCESS_LOG_INCLUDE_QUERY: bool = False
+
+    # ---------- 错误上报 Sentry（P7-B1） ----------
+    # DSN 留空即完全关闭（不引入任何网络上报，符合「数据不出域」默认姿态）。
+    SENTRY_DSN: str = ""
+    # 上报环境标识：留空则回退到 APP_ENV（development / production）
+    SENTRY_ENVIRONMENT: str = ""
+    # 性能追踪采样率（0~1）：0 表示只上报错误、不做 tracing，成本最低
+    SENTRY_TRACES_SAMPLE_RATE: float = 0.0
+    # 是否上报请求中的个人信息（IP、Cookie、请求头）。
+    # 合规默认 False：私有化/等保场景下 PII 不应离开本地。
+    SENTRY_SEND_DEFAULT_PII: bool = False
+
+    # ---------- LLM 调用限流 / 配额（P7-B1） ----------
+    # 总开关：关闭后不做任何限流（压测或单机私有化可按需关闭）。
+    LLM_RATE_LIMIT_ENABLED: bool = True
+    # 单用户每分钟最多发起多少次对话（滑动窗口按自然分钟计数）。
+    # 取值参考：正常用户每分钟提问 1~5 次，20 次足以容纳连点与重试，又能挡住脚本刷。
+    LLM_RATE_LIMIT_PER_MINUTE: int = 20
+    # 单用户每日最多发起多少次对话（自然日，按服务器时区）。
+    LLM_RATE_LIMIT_PER_DAY: int = 300
+    # 单用户每日 token 配额（输入+输出合计）；0 表示不限制。
+    # 为什么要 token 配额：次数配额挡不住「一次塞 8000 字 + 长回答」的成本放大。
+    LLM_DAILY_TOKEN_QUOTA: int = 200_000
+    # 限流计数在 Redis 中的 key 前缀（带版本号便于策略变更后整体失效）
+    LLM_RATE_LIMIT_KEY_PREFIX: str = "ratelimit:llm:v1"
+    # 限流专用 Redis 地址：留空则复用 REDIS_CACHE_URL（db2），避免多一处配置。
+    RATE_LIMIT_REDIS_URL: str = ""
+    # Redis 不可达时的策略：True=放行（fail-open，保业务可用）；
+    # False=拒绝（fail-closed，保成本可控）。默认放行并告警——
+    # 限流是保护措施，不应在依赖故障时把整个问答功能打死。
+    RATE_LIMIT_FAIL_OPEN: bool = True
+
+    # ---------- 监控指标（P7-Dep1：Prometheus） ----------
+    # 总开关：关闭后 /metrics 返回 404，且不注册中间件指标（省一点开销）。
+    METRICS_ENABLED: bool = True
+    # 指标暴露路径（nginx 侧建议只对内网/白名单开放）
+    METRICS_PATH: str = "/metrics"
+    # 抓取令牌：非空时访问 /metrics 必须携带 Bearer（或 ?token=）。
+    # 为什么需要：/metrics 会暴露接口拓扑与流量规模，生产不宜完全公开。
+    METRICS_TOKEN: str = ""
+    # 慢请求阈值（毫秒）：超过即在访问日志中标记 slow=true，便于 grep 定位
+    METRICS_SLOW_REQUEST_MS: int = 2000
+    # Grafana 面板地址（仅用于前端状态页展示「打开监控面板」链接，可留空）
+    GRAFANA_URL: str = ""
+
+    # ---------- 备份（P7-DB1 / P7-Dep1） ----------
+    # 总开关：关闭后定时任务不注册，手动备份接口返回「未启用」
+    BACKUP_ENABLED: bool = True
+    # 备份文件目录（相对 backend 目录；容器内建议挂载独立卷/对象存储）
+    BACKUP_DIR: str = "data/backups"
+    # pg_dump 可执行文件：容器内为 pg_dump（随 postgres 客户端安装），
+    # 本机可用 Homebrew 的绝对路径（如 /opt/homebrew/opt/postgresql@16/bin/pg_dump）
+    BACKUP_PG_DUMP_BIN: str = "pg_dump"
+    # 单次备份的超时（秒）：库越大越久，超时后杀掉子进程并标记失败
+    BACKUP_TIMEOUT: float = 1800.0
+    # 保留策略：按天数与个数双重约束，任一超限即清理（0 表示不按该维度清理）
+    BACKUP_RETENTION_DAYS: int = 14
+    BACKUP_RETENTION_COUNT: int = 30
+    # 每日备份执行时刻（小时，0~23，服务器本地时区），配合 Celery beat 使用
+    BACKUP_SCHEDULE_HOUR: int = 3
+    # 备份完成后是否顺带做一次 Redis BGSAVE 并校验持久化状态
+    BACKUP_REDIS_CHECK: bool = True
+
+    # =================================================================
+    # P7 生产加固 — 功能2：合规与私有化部署
+    # =================================================================
+
+    # ---------- 数据不出域（P7-B2） ----------
+    # 模式：
+    #   standard — 仅记录出站去向，不做拦截（普通公有云部署）
+    #   strict   — 强制校验出站域名白名单，未在白名单内的外部调用直接失败
+    #              （等保/金融/政务私有化场景）
+    DATA_RESIDENCY_MODE: str = "standard"
+    # 允许出站的域名白名单（逗号分隔，支持后缀匹配：.aliyuncs.com 匹配其子域）。
+    # strict 模式下留空表示「只允许内网/本机地址」（即完全本地化模型部署）。
+    OUTBOUND_ALLOWED_HOSTS: str = ""
+    # 数据驻留区域标识（仅用于合规展示与审计记录，如 cn / cn-shanghai / on-prem）
+    DATA_REGION: str = "cn"
+
+    # ---------- 审计日志（P7-B2） ----------
+    # 总开关：关闭后不再写审计（仅保留普通日志），一般只在压测时关闭。
+    AUDIT_ENABLED: bool = True
+    # 审计日志保留天数：超期由定时任务清理（等保通常要求 ≥180 天）
+    AUDIT_RETENTION_DAYS: int = 180
+    # 是否审计「读操作」（对话、列表查询等）。
+    # 默认 False：这些操作量大且价值低，审计它们会把库写满、并淹没真正的敏感动作。
+    AUDIT_LOG_READS: bool = False
+
+    # ---------- 日志与审计的派生属性 ----------
 
     @property
     def cors_origins_list(self) -> List[str]:
@@ -413,6 +524,73 @@ class Settings(BaseSettings):
     def max_upload_size_mb_for(self, file_type: str) -> float:
         """按类型返回上限的 MB 表示（用于错误提示与前端文案）。"""
         return round(self.max_upload_size_for(file_type) / (1024 * 1024), 2)
+
+    # ---------- P7 派生配置 ----------
+
+    @property
+    def is_json_log(self) -> bool:
+        """是否使用 JSON 结构化日志（生产采集 ELK / Loki 时为 True）。"""
+        return (self.LOG_FORMAT or "").strip().lower() == "json"
+
+    @property
+    def sentry_environment(self) -> str:
+        """Sentry 环境标识：未单独配置时回退到 APP_ENV。"""
+        return (self.SENTRY_ENVIRONMENT or "").strip() or self.APP_ENV
+
+    @property
+    def is_sentry_enabled(self) -> bool:
+        """是否启用 Sentry 上报（DSN 非空才算启用）。
+
+        说明：DSN 为空时不引入任何外发流量——私有化部署默认即如此，
+        与「数据不出域」的默认姿态一致（合规审计项会检查这一点）。
+        """
+        return bool((self.SENTRY_DSN or "").strip())
+
+    @property
+    def rate_limit_redis_url(self) -> str:
+        """限流专用 Redis 地址：未单独配置时复用检索缓存所用的 db2。"""
+        return (self.RATE_LIMIT_REDIS_URL or "").strip() or self.REDIS_CACHE_URL
+
+    @property
+    def outbound_allowed_hosts_list(self) -> List[str]:
+        """把逗号分隔的出站白名单解析为小写列表（去空）。"""
+        return [
+            item.strip().lower()
+            for item in self.OUTBOUND_ALLOWED_HOSTS.split(",")
+            if item.strip()
+        ]
+
+    @property
+    def is_strict_residency(self) -> bool:
+        """是否为「严格数据不出域」模式（strict 才做拦截）。"""
+        return (self.DATA_RESIDENCY_MODE or "").strip().lower() == "strict"
+
+    @property
+    def backup_dir_abs(self) -> str:
+        """备份目录的绝对路径（相对路径以 backend 目录为基准）。
+
+        为什么不直接用 cwd：uvicorn 可能从任意目录启动，
+        用文件位置推导 backend 根目录可保证「无论在哪启动都落在同一处」。
+        """
+        import os
+
+        if os.path.isabs(self.BACKUP_DIR):
+            return self.BACKUP_DIR
+        # __file__ = backend/app/config.py → dirname(dirname()) = backend
+        backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(backend_root, self.BACKUP_DIR)
+
+    @property
+    def log_file_abs(self) -> str:
+        """日志文件的绝对路径（留空表示只输出 stdout）。"""
+        import os
+
+        if not (self.LOG_FILE or "").strip():
+            return ""
+        if os.path.isabs(self.LOG_FILE):
+            return self.LOG_FILE
+        backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(backend_root, self.LOG_FILE)
 
 
 @lru_cache(maxsize=1)

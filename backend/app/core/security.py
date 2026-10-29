@@ -30,6 +30,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
+from ..core import request_context
 from ..core.errors import ForbiddenError, UnauthorizedError
 from ..core.logging import get_logger
 from ..db.engine import SessionLocal, get_db
@@ -139,12 +140,19 @@ async def get_user_for_request(db: AsyncSession, token: Optional[str]) -> User:
 
     # 本地无鉴权联调：回退 Demo 用户身份
     if not cfg.AUTH_REQUIRED:
-        return await _ensure_demo_user_in_session(db)
+        user = await _ensure_demo_user_in_session(db)
+        # P7-B2：把身份写入请求上下文，供日志/审计自动带上（无需逐层传参）
+        request_context.bind_user(str(user.id), user.username)
+        return user
 
     if not token:
         raise UnauthorizedError("缺少登录令牌，请先登录")
 
-    return await auth_service.get_user_from_token(db, token)
+    user = await auth_service.get_user_from_token(db, token)
+    # P7-B2：鉴权成功后绑定身份上下文（审计/日志直接读取）
+    request_context.bind_user(str(user.id), user.username)
+    return user
+
 
 
 async def get_current_user(

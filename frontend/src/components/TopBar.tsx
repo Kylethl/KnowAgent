@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Button, Dropdown, Space, Typography } from 'antd';
 import {
   CloudUploadOutlined,
+  DashboardOutlined,
   LogoutOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
@@ -19,6 +20,9 @@ import NotificationBell from './NotificationBell';
 // P6-F1：右侧新增通知铃铛（站内信 + 审核结果 Toast）。
 //        放在顶栏的原因：对话页与管理后台都复用本组件，通知是全局能力，
 //        挂在这里即可覆盖所有登录页面，不必每页各写一遍轮询逻辑。
+// P7：管理员额外显示「系统状态」入口（监控 / 备份 / 审计 / 合规）。
+//     与「管理后台」并列而非嵌套：运维动作（看依赖、跑备份）与内容审核是两条动线，
+//     混在一处会让日常审核被监控信息打断。
 // 小功能：左侧品牌区（图标 + 「知识库问答」）在传入 onHomeClick 时可点击返回对话页，
 //       例如从管理后台点它即可回到对话界面；对话页自身不传该回调，故品牌区不可点击。
 interface Props {
@@ -26,6 +30,7 @@ interface Props {
   user?: AuthUser | null; // 当前登录用户（P2-F2；未登录时为 null）
   onLogout?: () => void; // 点击「退出登录」的回调
   onAdminClick?: () => void; // 点击「管理后台」的回调（P3-F1；仅管理员且传入时显示入口）
+  onOpsClick?: () => void; // 点击「系统状态」的回调（P7；仅管理员且传入时显示入口）
   onHomeClick?: () => void; // 点击左侧品牌区的回调（传入后品牌区才可点击，用于返回对话页）
 }
 
@@ -34,6 +39,7 @@ export default function TopBar({
   user,
   onLogout,
   onAdminClick,
+  onOpsClick,
   onHomeClick,
 }: Props) {
   // 品牌区悬停态：仅在可点击时用于高亮背景（style 对象无法写 :hover，故用状态驱动）
@@ -118,6 +124,13 @@ export default function TopBar({
         {user?.role === 'admin' && onAdminClick && (
           <Button icon={<SafetyCertificateOutlined />} onClick={onAdminClick}>
             管理后台
+          </Button>
+        )}
+
+        {/* P7：系统状态入口（监控 / 备份 / 审计 / 合规自检） */}
+        {user?.role === 'admin' && onOpsClick && (
+          <Button icon={<DashboardOutlined />} onClick={onOpsClick}>
+            系统状态
           </Button>
         )}
 

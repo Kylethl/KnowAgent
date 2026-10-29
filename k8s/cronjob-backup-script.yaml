@@ -1,0 +1,93 @@
+# 容器备份脚本 ConfigMap（P7-DB1）
+# ---------------------------------------------------------------------
+# 供 cronjob-backup.yaml 挂载到 postgres:16-alpine 容器内执行。
+# 与 backend/scripts/backup_postgres.sh 的区别：
+#   - 容器内用 PGHOST/PGUSER/PGPASSWORD/PGDATABASE 连接（libpq 标准变量），
+#     而非 SQLAlchemy 的 DATABASE_URL；
+#   - 用 md5sum 替代 macOS 的 shasum（alpine 自带 md5sum，无 shasum）。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knowagent-backup-script
+  namespace: knowagent
+data:
+  backup_postgres.sh: |
+    #!/bin/sh
+    # 容器内 pg_dump 备份：产出与后端 backup_service 同格式的 .sql.gz + manifest
+    set -eu
+
+    BACKUP_DIR="${BACKUP_DIR:-/backups}"
+    RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
+    RETENTION_COUNT="${BACKUP_RETENTION_COUNT:-30}"
+
+    mkdir -p "${BACKUP_DIR}"
+    STAMP="$(date -u +%Y%m%d-%H%M%S)"
+    NAME="knowagent-${STAMP}.sql.gz"
+    TARGET="${BACKUP_DIR}/${NAME}"
+    TMP_TARGET="${TARGET}.part"
+
+    echo "[backup] 开始：$(date -u -Iseconds) → ${TARGET}"
+
+    # pg_dump 走 libpq 环境变量（PGHOST/PGUSER/PGPASSWORD/PGDATABASE）
+    if ! PGCONNECT_TIMEOUT=10 pg_dump --no-owner --no-acl --format=plain | gzip -6 > "${TMP_TARGET}"; then
+      echo "[backup] 错误：pg_dump 失败" >&2
+      rm -f "${TMP_TARGET}"
+      exit 2
+    fi
+
+    if [ ! -s "${TMP_TARGET}" ]; then
+      echo "[backup] 错误：备份文件为空" >&2
+      rm -f "${TMP_TARGET}"
+      exit 2
+    fi
+
+    if ! gzip -t "${TMP_TARGET}" 2>/dev/null; then
+      echo "[backup] 错误：gzip 流损坏" >&2
+      rm -f "${TMP_TARGET}"
+      exit 3
+    fi
+
+    if ! gzip -dc "${TMP_TARGET}" | tail -n 5 | grep -q "PostgreSQL database dump complete"; then
+      echo "[backup] 错误：缺少 pg_dump 完成标记" >&2
+      rm -f "${TMP_TARGET}"
+      exit 3
+    fi
+
+    mv "${TMP_TARGET}" "${TARGET}"
+
+    SIZE_BYTES="$(wc -c < "${TARGET}" | tr -d ' ')"
+    SHA256="$(md5sum "${TARGET}" | awk '{print $1}')"
+
+    cat > "${TARGET}.json" <<JSON
+    {
+      "name": "${NAME}",
+      "size_bytes": ${SIZE_BYTES},
+      "sha256_md5": "${SHA256}",
+      "created_at": "$(date -u -Iseconds)",
+      "trigger": "cronjob",
+      "database": "${PGHOST}:${PGPORT:-5432}/${PGDATABASE}",
+      "verified": true
+    }
+    JSON
+
+    echo "[backup] 完成：${NAME}（$(( SIZE_BYTES / 1024 / 1024 ))MB）"
+
+    # 保留策略：按个数 + 天数双约束清理
+    removed=0
+    index=0
+    for file in $(ls -1t "${BACKUP_DIR}"/knowagent-*.sql.gz 2>/dev/null || true); do
+      index=$((index + 1))
+      too_many=0; too_old=0
+      if [ "${RETENTION_COUNT}" -gt 0 ] && [ "${index}" -gt "${RETENTION_COUNT}" ]; then
+        too_many=1
+      fi
+      if [ "${RETENTION_DAYS}" -gt 0 ] && [ -n "$(find "${file}" -mtime +"${RETENTION_DAYS}" -print -quit 2>/dev/null)" ]; then
+        too_old=1
+      fi
+      if [ "${too_many}" -eq 1 ] || [ "${too_old}" -eq 1 ]; then
+        rm -f "${file}" "${file}.json"
+        removed=$((removed + 1))
+      fi
+    done
+    [ "${removed}" -gt 0 ] && echo "[backup] 已清理 ${removed} 个过期备份"
+    exit 0

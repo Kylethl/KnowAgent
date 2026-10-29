@@ -18,16 +18,22 @@ from .api import conversations as conversations_router
 from .api import documents as documents_router
 from .api import feedback as feedback_router
 from .api import notifications as notifications_router
+from .api import ops as ops_router
 from .config import get_settings
+from .core import metrics, sentry
 from .core.errors import (
+    DataResidencyViolation,
     ForbiddenError,
     InvalidCredentials,
+    RateLimitExceeded,
     UnauthorizedError,
     UserAlreadyExists,
     WeakPasswordError,
 )
 from .core.logging import get_logger, setup_logging
+from .core.middleware import ObservabilityMiddleware
 from .core.security import ensure_demo_user
+from .db.engine import ping as db_ping
 from .schemas import HealthResponse
 from .services import media_extract
 
@@ -42,9 +48,61 @@ async def lifespan(app: FastAPI):
     服务也应能起来供前端联调，/chat 会返回明确的配置缺失提示。
     """
     settings = get_settings()
-    setup_logging(settings.LOG_LEVEL)
+    # P7-B1：结构化日志。JSON 格式供生产采集，text 供本地阅读；
+    # 可选落盘 + 按大小轮转（容器部署通常留空，交给日志驱动收集）。
+    setup_logging(
+        level=settings.LOG_LEVEL,
+        fmt=settings.LOG_FORMAT,
+        file_path=settings.log_file_abs,
+        max_bytes=settings.LOG_MAX_BYTES,
+        backup_count=settings.LOG_BACKUP_COUNT,
+    )
+
+    # P7-B1：错误上报（DSN 为空则是 no-op，不产生任何外发流量）
+    sentry.init_sentry(settings)
+    # P7-Dep1：应用信息指标（Grafana 上可按版本/环境过滤）
+    metrics.set_app_info("0.1.0", settings.APP_ENV)
 
     logger.info("启动 %s（env=%s）", settings.APP_NAME, settings.APP_ENV)
+    logger.info(
+        "可观测性：log_format=%s，log_file=%s，sentry=%s，metrics=%s（后端 %s）",
+        settings.LOG_FORMAT,
+        settings.log_file_abs or "(仅 stdout)",
+        "enabled" if sentry.is_enabled() else "disabled",
+        "enabled" if settings.METRICS_ENABLED else "disabled",
+        metrics.backend_name(),
+    )
+    # P7-B1：限流与配额自检（关闭时明确告警——生产环境关闭意味着成本不受控）
+    if settings.LLM_RATE_LIMIT_ENABLED:
+        logger.info(
+            "LLM 限流已启用：%d 次/分钟、%d 次/日、%s token/日（Redis=%s）",
+            settings.LLM_RATE_LIMIT_PER_MINUTE,
+            settings.LLM_RATE_LIMIT_PER_DAY,
+            settings.LLM_DAILY_TOKEN_QUOTA or "不限",
+            settings.rate_limit_redis_url,
+        )
+    else:
+        logger.warning("⚠️ LLM 限流已关闭（LLM_RATE_LIMIT_ENABLED=false）：成本与滥用风险不受控")
+    # P7-B2：数据不出域模式自检
+    if settings.is_strict_residency:
+        logger.info(
+            "数据不出域：strict 模式，允许出站域名=%s",
+            ", ".join(settings.outbound_allowed_hosts_list) or "(仅内网)",
+        )
+    else:
+        logger.info("数据不出域：standard 模式（仅记录出站目标，不拦截）")
+    # P7-DB1：备份能力自检
+    if settings.BACKUP_ENABLED:
+        logger.info(
+            "备份已启用：目录=%s，保留 %d 天 / %d 份，每日 %02d:00 执行",
+            settings.backup_dir_abs,
+            settings.BACKUP_RETENTION_DAYS,
+            settings.BACKUP_RETENTION_COUNT,
+            settings.BACKUP_SCHEDULE_HOUR,
+        )
+    else:
+        logger.warning("备份未启用（BACKUP_ENABLED=false）：数据库无自动备份")
+
     if settings.is_deepseek_configured:
         logger.info(
             "DeepSeek 已配置：base_url=%s，model=%s",
@@ -116,6 +174,55 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ---------- 可观测性中间件（P7-B1） ----------
+    # 放在 CORS 之后添加 → 成为最外层：连预检请求与 4xx 也会被记录，
+    # 且 request_id 在进入业务代码前就已就绪（日志/审计都能带上）。
+    app.add_middleware(ObservabilityMiddleware)
+
+    # ---------- 全局异常处理器（P7：限流 / 数据不出域） ----------
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _rate_limited_handler(request: Request, exc: RateLimitExceeded):
+        """LLM 配额超限 → 429，并带 Retry-After 让客户端知道何时可重试。
+
+        Retry-After 是 HTTP 标准头，浏览器/前端库都能直接读取；
+        同时也把可读文案放进 detail，前端可直接展示给用户。
+        """
+        logger.warning(
+            "请求被限流：path=%s，scope=%s，limit=%s，retry_after=%s",
+            request.url.path,
+            exc.scope,
+            exc.limit,
+            exc.retry_after,
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": exc.message,
+                "scope": exc.scope,
+                "limit": exc.limit,
+                "retry_after": exc.retry_after,
+            },
+            headers={"Retry-After": str(max(1, int(exc.retry_after)))},
+        )
+
+    @app.exception_handler(DataResidencyViolation)
+    async def _residency_handler(request: Request, exc: DataResidencyViolation):
+        """数据不出域拦截 → 503（能力因合规策略不可用，非客户端错误）。
+
+        用 503 而不是 403：这不是「你没权限」，而是「本部署策略不允许该能力」，
+        运维看到 503 会去查配置，用户看到的提示也能明确指向合规策略。
+        """
+        logger.error("数据不出域拦截：%s", exc.message)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": exc.message,
+                "host": exc.host,
+                "purpose": exc.purpose,
+            },
+        )
+
     # ---------- 全局异常处理器（P2-B2：鉴权领域异常 → HTTP 状态码） ----------
     # 统一在这里映射，避免每个路由重复写 try/except。
     # 401 响应按 RFC 6750 带 WWW-Authenticate 头，便于前端/网关识别需重新登录。
@@ -177,10 +284,18 @@ def create_app() -> FastAPI:
     app.include_router(feedback_router.router)
     # P6-B2：/admin/feedback/summary（答案质量评估概览，路由级 require_admin）
     app.include_router(feedback_router.admin_router)
+    # P7：/ops/*（运维状态 / 审计查询 / 备份 / 合规自检，路由级 require_admin）
+    app.include_router(ops_router.router)
+    # P7：/metrics（Prometheus 抓取；不要求管理员，按 METRICS_TOKEN 可选保护）
+    app.include_router(ops_router.metrics_router)
 
     @app.get("/health", response_model=HealthResponse, tags=["ops"], summary="健康检查")
     async def health() -> HealthResponse:
-        """健康检查接口：供 Docker Compose / nginx 冒烟测试使用。
+        """存活探针：只确认进程在跑，不做任何外部依赖检查。
+
+        为什么保持「轻量」：
+            Docker/K8s 会高频调用它（每 5~10 秒），一旦这里去连数据库/Redis，
+            依赖抖动会让容器被误杀重启。依赖检查放在 /health/ready 与 /ops/status。
 
         llm_ready 为 False 表示未配置 DeepSeek Key——服务本身健康，但无法真实回答。
         """
@@ -197,6 +312,24 @@ def create_app() -> FastAPI:
             media_asr_ready=bool(caps["asr"]),
             media_ffmpeg=bool(caps["ffmpeg"]),
         )
+
+    @app.get("/health/ready", tags=["ops"], summary="就绪检查（依赖探活）")
+    async def readiness() -> JSONResponse:
+        """就绪探针：数据库可用才返回 200，否则 503。
+
+        用途：
+            - K8s readinessProbe：未就绪的 Pod 不接流量（避免 500 打到用户）；
+            - 部署脚本的「等服务起来」判断。
+
+        说明：只检查**关键路径依赖**（数据库）。Redis/对象存储属于可降级依赖，
+        它们不可用时系统仍能对话（缓存失效、入库排队），因此不阻断就绪。
+        """
+        db_ok = await db_ping()
+        payload = {
+            "status": "ok" if db_ok else "degraded",
+            "database": "ok" if db_ok else "down",
+        }
+        return JSONResponse(status_code=200 if db_ok else 503, content=payload)
 
     return app
 

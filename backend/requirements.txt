@@ -73,3 +73,14 @@ Pillow>=10.0.0
 #   本机开发与容器镜像行为一致，不需要 root 权限，也不会因 base 镜像缺 ffmpeg 而功能失效。
 # 若部署环境已自带 ffmpeg，可在 .env 中用 MEDIA_FFMPEG_BIN 指向系统路径，优先使用。
 imageio-ffmpeg>=0.5.0
+
+# ---------- 监控与错误上报（P7-B1：可观测性） ----------
+# Prometheus 指标：暴露 /metrics 供 Prometheus 抓取、Grafana 出图与告警。
+# 说明：采用**可选依赖**策略（见 core/metrics.py）——未安装时自动降级为进程内轻量实现，
+#      /metrics 仍可访问；生产镜像请务必安装，才能获得完整的直方图桶与标准 registry 能力。
+prometheus-client>=0.20
+
+# 错误上报：把未捕获异常送到 Sentry / GlitchTip（含自建私有化实例）。
+# 只在配置了 SENTRY_DSN 时初始化，未配置时零外发流量（符合「数据不出域」默认姿态）。
+sentry-sdk[fastapi]>=2.0
+

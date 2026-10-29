@@ -25,7 +25,7 @@ from ..core.security import get_current_user
 from ..db.engine import get_db
 from ..db.models import User
 from ..schemas import LoginRequest, RegisterRequest, TokenResponse, UserOut
-from ..services import auth_service
+from ..services import audit_service, auth_service
 
 logger = get_logger(__name__)
 
@@ -93,6 +93,14 @@ async def register(
         raise UserAlreadyExists(field="username")
 
     logger.info("用户注册成功：username=%s", payload.username)
+    # P7-B2：注册是账号生命周期的起点，写审计（不记录密码等敏感字段）
+    await audit_service.record(
+        "auth.register",
+        user=user,
+        resource_type="user",
+        resource_id=str(user.id),
+        detail={"email_provided": bool(payload.email)},
+    )
     return _to_user_out(user)
 
 
@@ -109,8 +117,21 @@ async def login(
     Raises:
         InvalidCredentials: 用户名或密码错误 / 账号被禁用（→ 401，不区分具体原因）。
     """
-    # 认证失败由 auth_service 抛 InvalidCredentials（统一文案，防用户名枚举）
-    user = await auth_service.authenticate_user(db, payload.username, payload.password)
+    try:
+        # 认证失败由 auth_service 抛 InvalidCredentials（统一文案，防用户名枚举）
+        user = await auth_service.authenticate_user(db, payload.username, payload.password)
+    except InvalidCredentials:
+        # P7-B2：登录失败是安全审计里最重要的事件之一——
+        # 连续失败往往意味着撞库/暴力破解，必须留痕（只记用户名，不记密码）。
+        await audit_service.record(
+            "auth.login_failed",
+            result="failure",
+            username=payload.username,
+            role="anonymous",
+            resource_type="user",
+            detail={"reason": "invalid_credentials"},
+        )
+        raise
 
     token = auth_service.create_access_token(user)
 
@@ -118,6 +139,14 @@ async def login(
 
     cfg = get_settings()
     logger.info("用户登录成功：username=%s，id=%s", user.username, user.id)
+    # P7-B2：登录成功留痕（含角色，便于核查是否有人以 admin 身份进入）
+    await audit_service.record(
+        "auth.login",
+        user=user,
+        resource_type="user",
+        resource_id=str(user.id),
+        detail={"role": user.role},
+    )
     return TokenResponse(
         access_token=token,
         token_type="bearer",

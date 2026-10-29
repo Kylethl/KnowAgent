@@ -53,6 +53,8 @@ from ..schemas import (
 )
 from ..services import embedding as embedding_mod
 from ..services import indexing_service, media_types, review_service
+# P7-B2：审计日志（审核 / 重入库 / 下线等敏感动作留痕）
+from ..services import audit_service
 from ..services.storage import BaseStorage, StorageError
 # 复用 /documents 中已定义的存储依赖，保证两种场景用同一套后端构造逻辑
 from .documents import get_storage_dep
@@ -251,8 +253,25 @@ async def review_document(
             db=db, doc=doc, reviewer=admin, action=payload.action, note=payload.note
         )
     except DocumentNotFound as exc:
+        # P7-B2：越权之外的「对象不存在」也留痕——能看出谁在扫描不存在的文档 ID
+        await audit_service.record(
+            "document.review",
+            result="failure",
+            user=admin,
+            resource_type="document",
+            resource_id=document_id,
+            detail={"reason": "document_not_found", "action": payload.action},
+        )
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.message) from exc
     except ReviewNotAllowed as exc:
+        await audit_service.record(
+            "document.review",
+            result="failure",
+            user=admin,
+            resource_type="document",
+            resource_id=document_id,
+            detail={"reason": exc.message, "action": payload.action},
+        )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.message) from exc
 
     # 审核人用户名直接取自当前管理员，无需再查库
@@ -263,6 +282,21 @@ async def review_document(
 
     logger.info(
         "管理员 %s 审核文档 %s：%s", admin.username, document_id, payload.action
+    )
+
+    # P7-B2：内容变更类操作必须留痕（谁在什么时候通过了哪份文档、理由是什么）。
+    # 放在审核成功之后、触发入库之前：即使后续入库失败，审核事实已经成立。
+    await audit_service.record(
+        "document.review",
+        user=admin,
+        resource_type="document",
+        resource_id=str(updated.id),
+        detail={
+            "action": payload.action,
+            "filename": updated.filename,
+            "note_len": len(payload.note or ""),
+            "uploader_id": str(updated.user_id) if updated.user_id else None,
+        },
     )
 
     # P3-B2：审核通过即触发入库（「审核通过 → 入库」链路的关键衔接点）。
@@ -316,6 +350,15 @@ async def index_document(
     queued = _dispatch_indexing(doc.id, doc.file_type)
     logger.info("管理员 %s 触发文档入库：%s", admin.username, document_id)
 
+    # P7-B2：重新入库会重建向量（可能产生 embedding 费用），必须留痕
+    await audit_service.record(
+        "document.reindex",
+        user=admin,
+        resource_type="document",
+        resource_id=str(doc.id),
+        detail={"filename": doc.filename, "queued": queued},
+    )
+
     return IndexResult(
         document=_to_out(doc, {}),
         queued=queued,
@@ -352,6 +395,15 @@ async def unpublish_document(
     # 重新读取以回传最新状态（含 chunk_count=0 / indexed_at=None）
     doc = await review_service.get_document_for_review(db, document_id)
     logger.info("管理员 %s 下线文档 %s", admin.username, document_id)
+
+    # P7-B2：下线会改变「用户能检索到什么」，属于内容可见性变更，必须留痕
+    await audit_service.record(
+        "document.unpublish",
+        user=admin,
+        resource_type="document",
+        resource_id=str(doc.id),
+        detail={"filename": doc.filename},
+    )
 
     return IndexResult(
         document=_to_out(doc, {}),

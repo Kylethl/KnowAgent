@@ -82,8 +82,31 @@ services:
       MEDIA_OCR_MODEL: ${MEDIA_OCR_MODEL:-qwen3.5-ocr}
       MEDIA_ASR_MODEL: ${MEDIA_ASR_MODEL:-qwen3.8-omni-flash}
       MEDIA_EXTRACT_ENABLED: "true"
+      # ---- P7：结构化日志 / 错误上报 ----
+      LOG_FORMAT: json
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      # ---- P7：LLM 限流与配额 ----
+      LLM_RATE_LIMIT_ENABLED: "true"
+      LLM_RATE_LIMIT_PER_MINUTE: ${LLM_RATE_LIMIT_PER_MINUTE:-20}
+      LLM_RATE_LIMIT_PER_DAY: ${LLM_RATE_LIMIT_PER_DAY:-300}
+      LLM_DAILY_TOKEN_QUOTA: ${LLM_DAILY_TOKEN_QUOTA:-200000}
+      RATE_LIMIT_REDIS_URL: redis://redis:6379/2
+      # ---- P7：监控指标 ----
+      METRICS_ENABLED: "true"
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # ---- P7：数据不出域（私有化 strict / 公有云 standard）----
+      DATA_RESIDENCY_MODE: ${DATA_RESIDENCY_MODE:-standard}
+      OUTBOUND_ALLOWED_HOSTS: ${OUTBOUND_ALLOWED_HOSTS:-}
+      # ---- P7：审计日志 ----
+      AUDIT_ENABLED: "true"
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-180}
+      # ---- P7：备份（应用内置 Celery beat 触发；容器化另配 backup 容器）----
+      BACKUP_ENABLED: ${BACKUP_ENABLED:-false}
+      BACKUP_DIR: /app/data/backups
     volumes:
       - uploads:/app/data/uploads
+      - backups:/app/data/backups
     depends_on:
       postgres:
         condition: service_healthy
@@ -169,3 +192,5 @@ volumes:
   uploads:
   # Redis AOF 持久化卷（Celery 队列与检索缓存）
   redisdata:
+  # 备份产物卷（与 backup 容器 / 应用内置备份共享）
+  backups:

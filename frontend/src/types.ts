@@ -462,3 +462,206 @@ export interface FeedbackSummary {
   reason_breakdown: Record<string, number>; // 点踩归因分布
   recent_down: FeedbackDownEntry[]; // 最近差评明细
 }
+
+// =====================================================================
+// P7：生产加固（监控 / 日志 / 备份 / 合规）
+// ---------------------------------------------------------------------
+// 契约来源：《需求清单》P7
+//   功能1：监控 / 日志 / 备份 —— 管理端「系统状态」页
+//   功能2：合规与私有化部署 —— 审计日志与合规自检
+// 字段与后端 app/schemas.py 的 Ops* / AuditLogOut / BackupItem 严格对齐（不驼峰转换）。
+// =====================================================================
+
+// 依赖检查状态：ok 正常 / degraded 降级可用 / down 不可用 / disabled 未启用
+export type ServiceStatus = 'ok' | 'degraded' | 'down' | 'disabled';
+
+// 单条依赖检查结果
+export interface OpsServiceStatus {
+  name: string; // 依赖标识：postgres / redis / object_storage / celery / deepseek / embedding / media
+  label: string; // 中文名
+  status: ServiceStatus;
+  detail: string; // 成功时是版本信息，失败时是原因
+  latency_ms: number | null; // 探测耗时（毫秒）
+}
+
+// 应用自身信息
+export interface OpsAppInfo {
+  name: string;
+  version: string;
+  env: string; // development / production
+  uptime_seconds: number;
+  log_format: string; // text / json
+  log_level: string;
+  sentry_enabled: boolean;
+  sentry_sdk_missing: boolean; // 配置了 DSN 但缺 SDK（部署缺陷）
+  metrics_enabled: boolean;
+  metrics_backend: string; // prometheus_client / builtin
+}
+
+// 当前用户的配额快照
+export interface OpsQuotaSnapshot {
+  allowed: boolean;
+  scope: string; // minute / day / tokens
+  minute_used: number;
+  minute_limit: number;
+  day_used: number;
+  day_limit: number;
+  tokens_used: number;
+  tokens_quota: number; // 0 表示不限
+  source: string; // redis / memory / disabled
+}
+
+// 对话模型与限流配置
+export interface OpsLlmInfo {
+  configured: boolean;
+  model: string;
+  rate_limit_enabled: boolean;
+  rate_limit_per_minute: number;
+  rate_limit_per_day: number;
+  daily_token_quota: number;
+  quota: OpsQuotaSnapshot | null;
+}
+
+// 一个备份文件
+export interface BackupItem {
+  name: string;
+  size_bytes: number;
+  created_at: string;
+  sha256: string | null;
+  elapsed_ms: number | null;
+  trigger: string | null; // manual / schedule / cli
+  operator: string | null;
+  verified: boolean; // 是否通过完整性校验
+  restore_hint: string; // 恢复命令（必须人工执行）
+  retention_days: number;
+}
+
+// 备份能力总览
+export interface BackupStatus {
+  enabled: boolean;
+  dir: string;
+  retention_days: number;
+  retention_count: number;
+  schedule_hour: number;
+  next_run_hint: string | null;
+  last: BackupItem | null;
+  count: number;
+  total_bytes: number;
+  last_verified: boolean;
+}
+
+// 审计概览
+export interface OpsAuditSummary {
+  total: number;
+  today: number;
+  failures: number;
+  last_event_at: string | null;
+  window_days: number;
+  top_actions: { action: string; label: string; count: number }[];
+  error?: string | null;
+}
+
+// 一个出站目标（数据去了哪里）
+export interface OpsResidencyTarget {
+  purpose: string; // llm / embedding / media
+  label: string;
+  url: string;
+  host: string;
+  model: string;
+  local: boolean; // 本机/内网（模型已本地化）
+  allowed: boolean; // 当前策略下是否放行
+}
+
+// 数据不出域策略
+export interface OpsResidencyInfo {
+  mode: string; // standard / strict
+  region: string;
+  strict: boolean;
+  allowlist: string[];
+  targets: OpsResidencyTarget[];
+}
+
+// 监控指标配置
+export interface OpsMetricsInfo {
+  enabled: boolean;
+  path: string;
+  token_required: boolean;
+  grafana_url: string;
+}
+
+// GET /ops/status 响应
+export interface OpsStatus {
+  app: OpsAppInfo;
+  services: OpsServiceStatus[];
+  llm: OpsLlmInfo;
+  backup: BackupStatus;
+  audit: OpsAuditSummary;
+  residency: OpsResidencyInfo;
+  metrics: OpsMetricsInfo;
+  generated_at: string;
+}
+
+// 单条审计记录
+export interface AuditLogItem {
+  id: string;
+  user_id: string | null;
+  username: string | null;
+  role: string | null;
+  action: string;
+  action_label: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  result: 'success' | 'failure';
+  ip: string | null;
+  request_id: string | null;
+  detail: Record<string, unknown> | null;
+  created_at: string;
+}
+
+// GET /ops/audit-logs 响应
+export interface AuditLogList {
+  items: AuditLogItem[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+// 审计动作筛选项
+export interface AuditActionOption {
+  value: string;
+  label: string;
+}
+
+// 合规自检项
+export interface ComplianceItem {
+  key: string;
+  title: string;
+  category: string; // 数据合规 / 审计 / 访问控制 / 暴露面 / 业务连续性 / 能力可用性
+  status: 'pass' | 'warn' | 'fail';
+  detail: string;
+  hint: string;
+}
+
+// GET /ops/compliance 响应
+export interface ComplianceReport {
+  generated_at: string;
+  mode: string;
+  region: string;
+  summary: { pass?: number; warn?: number; fail?: number };
+  items: ComplianceItem[];
+}
+
+// GET /chat/quota 响应（前端在提问前预检，避免 EventSource 拿不到 429 详情）
+export interface QuotaInfo {
+  enabled: boolean;
+  allowed: boolean;
+  scope: string;
+  message: string;
+  retry_after: number;
+  minute_used: number;
+  minute_limit: number;
+  day_used: number;
+  day_limit: number;
+  tokens_used: number;
+  tokens_quota: number;
+}

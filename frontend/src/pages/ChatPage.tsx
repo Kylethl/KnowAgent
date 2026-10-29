@@ -149,6 +149,8 @@ const [uploadOpen, setUploadOpen] = useState(false);
           user={user}
           onLogout={logout}
           onAdminClick={() => navigate('/admin')}
+          // P7：系统状态入口（仅管理员可见，由 TopBar 内部按角色判断）
+          onOpsClick={() => navigate('/ops')}
         />
         {/* 中间区域：横向居中，限制内容最大宽度，呈现豆包式窄栏对话 */}
         <div

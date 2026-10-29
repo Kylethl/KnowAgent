@@ -1,0 +1,49 @@
+# 前端（nginx 托管静态 + 反代 /api）+ 入口 Service（P7-Dep2）
+# ---------------------------------------------------------------------
+# 镜像构建：cd frontend && docker build -t knowagent-frontend:latest .
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowagent-frontend
+  namespace: knowagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: knowagent-frontend
+  template:
+    metadata:
+      labels:
+        app: knowagent-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: knowagent-frontend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowagent-frontend
+  namespace: knowagent
+spec:
+  selector:
+    app: knowagent-frontend
+  ports:
+    - port: 80
+      targetPort: 80

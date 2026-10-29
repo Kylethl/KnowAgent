@@ -1,0 +1,9 @@
+# 命名空间：knowagent（所有 P7 资源归属此命名空间）
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: knowagent
+  labels:
+    app.kubernetes.io/part-of: knowagent
+    # 默认给命名空间打「隔离」标签，网络策略据此默认拒绝跨命名空间流量
+    pod-security.kubernetes.io/enforce: baseline

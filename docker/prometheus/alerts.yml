@@ -1,0 +1,95 @@
+# Prometheus 告警规则（P7-Dep1）
+# ---------------------------------------------------------------------
+# 覆盖「可监控」的四个关键维度：
+#   1) 依赖健康（DB / Redis / 模型服务宕机）
+#   2) 业务连续性（备份失败 / 备份停滞）
+#   3) 服务质量（错误率、慢请求、限流激增）
+#   4) 容量（磁盘 / 内存）
+#
+# 这些规则只负责「判定 + 生成告警」，真正发通知由 Alertmanager 完成。
+# 单机轻量部署可跳过 Alertmanager，直接在 Grafana 的「Alerting」里接规则
+# （复用本文件指标表达式即可）。
+
+groups:
+  - name: knowagent_dependencies
+    rules:
+      # 任一关键依赖连续 5 分钟不可用 → 严重告警
+      - alert: DependencyDown
+        expr: knowagent_dependency_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "依赖不可用：{{ $labels.dependency }}"
+          description: "{{ $labels.dependency }} 已连续 5 分钟不可用，可能影响对话/检索/入库。"
+
+      # PostgreSQL 连接数超过上限的 80%（默认 100）
+      - alert: PostgresTooManyConnections
+        expr: pg_stat_activity_count > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL 连接数偏高"
+          description: "当前连接数 {{ $value }}，接近上限，可能存在连接泄漏。"
+
+  - name: knowagent_backup
+    rules:
+      # 备份执行失败（最近一次导出非成功）
+      - alert: BackupFailed
+        expr: knowagent_backup_success == 0
+        for: 1h
+        labels:
+          severity: critical
+        annotations:
+          summary: "数据库备份失败"
+          description: "最近一次备份未成功，请立即检查 pg_dump 与磁盘空间。"
+
+      # 超过 26 小时没有成功备份（每日 03:00 定时 + 2 小时余量）
+      - alert: BackupStale
+        expr: time() - knowagent_backup_last_success_timestamp > 93600
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "备份停滞超过 26 小时"
+          description: "已超过一天没有成功备份，数据存在丢失风险。"
+
+  - name: knowagent_service_quality
+    rules:
+      # 5xx 错误率超过 5%（滚动 5 分钟窗口）
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(knowagent_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(knowagent_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP 5xx 错误率过高"
+          description: "5 分钟窗口错误率 {{ $value | humanizePercentage }}，请检查后端日志。"
+
+      # 限流拒绝激增（说明有用户在刷，或配额过紧）
+      - alert: RateLimitSpike
+        expr: sum(rate(knowagent_rate_limit_rejected_total[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "限流拒绝次数激增"
+          description: "每分钟限流拒绝超过 10 次，可能存在滥用或配额配置过紧。"
+
+  - name: knowagent_capacity
+    rules:
+      # Prometheus 本地存储即将写满（提前 20% 预警）
+      - alert: PrometheusDiskAlmostFull
+        expr: prometheus_tsdb_storage_blocks_bytes / prometheus_tsdb_retention_limit_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus 存储使用超过 80%"
+          description: "时序数据即将触发淘汰，请扩容或缩短保留期。"

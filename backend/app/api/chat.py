@@ -43,20 +43,22 @@
 #     （见 POST /messages/{id}/feedback）。
 
 import asyncio
+import time
 from typing import AsyncIterator, List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from starlette.responses import Response
 
 from ..config import get_settings
-from ..core.errors import DeepSeekError
+from ..core import metrics, rate_limit
+from ..core.errors import DeepSeekError, RateLimitExceeded
 from ..core.logging import get_logger
-from ..core.security import get_current_user_id_sse
+from ..core.security import get_current_user_id, get_current_user_id_sse
 from ..core.sse import sse_comment, sse_content, sse_done, sse_headers, sse_json
 from ..db.engine import SessionLocal
-from ..schemas import ChatMessage, ChatRequest
+from ..schemas import ChatMessage, ChatRequest, QuotaResponse
 from ..services import conversation_service as svc
 from ..services.chat_chain import stream_answer
 from ..services.retriever import retrieve_for_chat, select_citations
@@ -68,6 +70,61 @@ router = APIRouter(tags=["chat"])
 
 # GET 分支的提问长度上限：与 POST 保持一致，防止超长 query 打爆请求行
 _MAX_MESSAGE_LENGTH = 8000
+
+
+async def _guard_llm_quota(
+    user_id: UUID = Depends(get_current_user_id_sse),
+) -> rate_limit.QuotaStatus:
+    """LLM 配额守门依赖（P7-B1）：进入流式生成前校验并消耗一次额度。
+
+    为什么做成依赖而不是在生成器里判断：
+        SSE 一旦开始下发数据就无法再改状态码（HTTP 头已发出），
+        必须在**返回 StreamingResponse 之前**拦截，才能给出规范的 429。
+
+    Raises:
+        RateLimitExceeded: 超出分钟/日次数或 token 配额（由全局处理器转 429）。
+    """
+    decision = await rate_limit.check_and_consume(user_id)
+    if not decision.allowed:
+        metrics.inc_llm_request("rate_limited")
+        raise RateLimitExceeded(
+            message=decision.message,
+            scope=decision.scope,
+            limit=decision.limit,
+            retry_after=decision.retry_after,
+            window="每分钟" if decision.scope == "minute" else "今日",
+        )
+    return decision
+
+
+@router.get(
+    "/chat/quota",
+    response_model=QuotaResponse,
+    summary="查询对话配额",
+    description=(
+        "返回当前用户的限流配置与剩余额度（只读，不消耗额度）。"
+        "前端用它替代「等 429」——EventSource 拿不到 429 的响应体，"
+        "先查配额才能给出可读提示。"
+    ),
+)
+async def get_chat_quota(
+    user_id: UUID = Depends(get_current_user_id),
+) -> QuotaResponse:
+    """查询当前用户的对话配额余量。"""
+    decision = await rate_limit.get_quota_status(user_id)
+    return QuotaResponse(
+        enabled=decision.enabled,
+        allowed=decision.allowed,
+        scope=decision.scope,
+        message=decision.message,
+        retry_after=decision.retry_after,
+        minute_used=decision.minute_used,
+        minute_limit=decision.minute_limit,
+        day_used=decision.day_used,
+        day_limit=decision.day_limit,
+        tokens_used=decision.tokens_used,
+        tokens_quota=decision.tokens_quota,
+    )
 
 
 @router.get("/chat", response_class=StreamingResponse)
@@ -84,10 +141,16 @@ async def chat_get(
     # P2-B2 鉴权：由依赖统一解析当前用户（令牌缺失/失效直接 401，不会进入流）。
     # EventSource 无法自定义请求头，故该依赖内部额外支持 ?token=xxx 传参。
     user_id: UUID = Depends(get_current_user_id_sse),
+    # P7-B1 配额：超限直接 429（不会建立 SSE 连接）
+    quota: rate_limit.QuotaStatus = Depends(_guard_llm_quota),
 ) -> Response:
     """SSE 流式对话（GET 入口，供 EventSource 消费）。"""
     return _stream_response(
-        message=message, conversation_id=conversation_id, history=None, user_id=user_id
+        message=message,
+        conversation_id=conversation_id,
+        history=None,
+        user_id=user_id,
+        quota=quota,
     )
 
 
@@ -96,6 +159,8 @@ async def chat_post(
     payload: ChatRequest,
     # P2-B2 鉴权：POST 走 fetch，优先用 Authorization 头；依赖内部同样兼容 ?token=
     user_id: UUID = Depends(get_current_user_id_sse),
+    # P7-B1 配额：超限返回 429 JSON（fetch 场景前端能读到 detail）
+    quota: rate_limit.QuotaStatus = Depends(_guard_llm_quota),
 ) -> Response:
     """SSE 流式对话（POST 入口，支持长文本与显式历史）。
 
@@ -108,6 +173,7 @@ async def chat_post(
         conversation_id=payload.conversation_id,
         history=payload.history,
         user_id=user_id,
+        quota=quota,
     )
 
 
@@ -116,6 +182,7 @@ def _stream_response(
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
     user_id: UUID,
+    quota: Optional[rate_limit.QuotaStatus] = None,
 ) -> StreamingResponse:
     """构造 SSE 流式响应。
 
@@ -124,13 +191,18 @@ def _stream_response(
         conversation_id: 会话 ID（可为空，落到默认会话或新建）。
         history: 客户端显式传入的历史；数据库可用时忽略，回退内存路径时使用。
         user_id: 当前登录用户 UUID（已由鉴权依赖解析，本函数不再做身份判断）。
+        quota: 本轮已消耗的配额状态（用于回答结束后累加 token 用量）。
 
     Returns:
         StreamingResponse：media_type 为 text/event-stream，逐帧推送回答片段。
     """
     return StreamingResponse(
         _event_generator(
-            message=message, conversation_id=conversation_id, history=history, user_id=user_id
+            message=message,
+            conversation_id=conversation_id,
+            history=history,
+            user_id=user_id,
+            quota=quota,
         ),
         media_type="text/event-stream",
         # 关闭 nginx 缓冲 + 禁用缓存，保证真正的「边生成边下发」
@@ -138,11 +210,47 @@ def _stream_response(
     )
 
 
+async def _record_usage(
+    user_id: UUID,
+    message: str,
+    answer: str,
+    meta: dict,
+    elapsed: float,
+) -> None:
+    """回答结束后记录 token 用量与调用指标（P7-B1）。
+
+    优先使用上游返回的 usage（准确）；上游未返回时按字符数估算
+    （估算偏保守，宁可高估让配额更早触发，也不要低估导致成本失控）。
+
+    Args:
+        user_id: 用户 ID（按用户累计配额）。
+        message: 用户提问（估算输入 token 用）。
+        answer: 完整回答（估算输出 token 用）。
+        meta: 流式过程中收集的元信息（可能含 usage）。
+        elapsed: 本轮耗时（秒）。
+    """
+    prompt_tokens = int(meta.get("prompt_tokens") or 0)
+    completion_tokens = int(meta.get("completion_tokens") or 0)
+    if prompt_tokens <= 0:
+        prompt_tokens = rate_limit.estimate_tokens(message)
+    if completion_tokens <= 0:
+        completion_tokens = rate_limit.estimate_tokens(answer)
+
+    try:
+        await rate_limit.record_tokens(user_id, prompt_tokens, completion_tokens)
+    except Exception as exc:  # noqa: BLE001 —— 记账失败不影响已完成的回答
+        logger.warning("token 用量记录失败（已忽略）：%s", exc)
+
+    metrics.inc_llm_request("success" if answer else "error")
+    metrics.observe_llm_duration(elapsed)
+
+
 async def _event_generator(
     message: str,
     conversation_id: Optional[str],
     history: Optional[List[ChatMessage]],
     user_id: UUID,
+    quota: Optional[rate_limit.QuotaStatus] = None,
 ) -> AsyncIterator[str]:
     """SSE 事件生成器：流式产出回答片段，并按 P2 约定做会话持久化与历史注入。
 
@@ -195,11 +303,15 @@ async def _event_generator(
             # retrieve_for_chat 内部吞掉全部异常并给出 mode，保证检索失败也能正常对话；
             # 结果同时下发给前端，用于渲染「命中 N 段资料 / 未命中 / 未启用」状态。
             retrieval = await retrieve_for_chat(message, db)
+            # P7-Dep1：检索模式分布进指标（Grafana 上可看「有多少提问真的命中了知识库」）
+            metrics.inc_rag(retrieval.mode)
             yield sse_json(retrieval.meta_payload())
 
             # 流式生成：历史来自 DB，关闭内存记忆（memory_enabled=False），避免双写；
             # context 非 None 即走检索增强链（无命中时为空串，由 Prompt 引导模型如实说明）。
             answer_parts: List[str] = []
+            # P7-B1：记录本轮耗时，用于 LLM 调用耗时直方图（P95/P99 是容量规划依据）
+            llm_started = time.perf_counter()
             try:
                 async for chunk in stream_answer(
                     message,
@@ -225,6 +337,16 @@ async def _event_generator(
 
             # 正常收尾：有完整回答才落库（避免把空回答/报错写入历史）
             full_answer = "".join(answer_parts)
+
+            # P7-B1：回答结束即结算用量（token 配额 + 调用指标），
+            # 放在落库之前——即使落库失败，已经消耗的模型费用也必须计入配额。
+            await _record_usage(
+                user_id=user_id,
+                message=message,
+                answer=full_answer,
+                meta=meta,
+                elapsed=time.perf_counter() - llm_started,
+            )
 
             # P4-B2：生成本轮引用来源（只保留回答实际标注过的资料；未标注时回退为全部检索资料）。
             # 必须放在「回答生成之后」——只有拿到完整回答，才能解析出 [n] 标注做来源映射。
@@ -283,7 +405,9 @@ async def _event_generator(
     # P4：无数据库时无法查询向量表，这里仍下发一帧「检索未启用」，
     # 使前端对 retrieval 帧的处理逻辑保持单一（有帧即渲染状态，不区分链路）。
     fallback_retrieval = await retrieve_for_chat(message, None)
+    metrics.inc_rag(fallback_retrieval.mode)
     yield sse_json(fallback_retrieval.meta_payload())
+    llm_started = time.perf_counter()
     try:
         async for chunk in stream_answer(
             message,
@@ -304,6 +428,16 @@ async def _event_generator(
         yield sse_content(f"\n\n[回答失败] 服务内部错误：{exc}")
 
     full_answer = "".join(answer_parts)
+
+    # P7-B1：无数据库路径同样结算用量（限流配额按用户计，与是否落库无关）
+    await _record_usage(
+        user_id=user_id,
+        message=message,
+        answer=full_answer,
+        meta=meta,
+        elapsed=time.perf_counter() - llm_started,
+    )
+
     if meta.get("finish_reason") == "length":
         logger.warning(
             "回答因达到 max_tokens 上限被截断：conversation_id=%s，已生成 %d 字符",

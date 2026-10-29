@@ -1,0 +1,3 @@
+# 敏感配置：复制 secret.yaml.example 为 secret.yaml 后填写，切勿提交真实值
+secret.yaml
+*.env

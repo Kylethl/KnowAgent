@@ -1,0 +1,67 @@
+# Redis（P7-Dep2：AOF 持久化 + 持久卷）
+# ---------------------------------------------------------------------
+# 承担 Celery broker/result + 检索缓存 + 限流计数。
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowagent-redis
+  namespace: knowagent
+spec:
+  selector:
+    app: knowagent-redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowagent-redis
+  namespace: knowagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: knowagent-redis
+  template:
+    metadata:
+      labels:
+        app: knowagent-redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # 开启 AOF，重启不丢队列（P7-DB1 Redis 持久化要求）
+          command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: redisdata
+              mountPath: /data
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: redisdata
+          persistentVolumeClaim:
+            claimName: knowagent-redis-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: knowagent-redis-data
+  namespace: knowagent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi

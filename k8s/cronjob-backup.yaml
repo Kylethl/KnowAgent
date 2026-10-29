@@ -1,0 +1,77 @@
+# 定时备份 CronJob（P7-DB1：PostgreSQL 定期备份）
+# ---------------------------------------------------------------------
+# 每日 03:00（UTC）用 postgres 镜像内置 pg_dump 导出 + gzip，写入 PVC。
+# 保留策略由脚本内部清理（BACKUP_RETENTION_DAYS/COUNT）。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: knowagent-backup
+  namespace: knowagent
+spec:
+  # 每日 03:00 UTC（对应北京时间 11:00，可按需调）
+  schedule: "0 3 * * *"
+  # 并发策略：上一次未完成则跳过本次（避免大库备份重叠）
+  concurrencyPolicy: Forbid
+  # 保留 3 个成功 / 1 个失败的 Job 记录（避免 Job 堆积）
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      # 备份超时 30 分钟；失败自动重试 1 次
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              env:
+                - name: PGHOST
+                  value: knowagent-postgres
+                - name: PGUSER
+                  value: knowagent
+                - name: PGDATABASE
+                  value: knowagent
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: knowagent-secret
+                      key: POSTGRES_PASSWORD
+                - name: BACKUP_RETENTION_DAYS
+                  value: "14"
+                - name: BACKUP_RETENTION_COUNT
+                  value: "30"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # 备份到 PVC，文件名带时间戳；脚本内做 gzip + 保留清理
+                  BACKUP_DIR=/backups \
+                  bash /usr/local/bin/backup_postgres.sh
+              volumeMounts:
+                - name: backupdata
+                  mountPath: /backups
+                # 挂载备份脚本（从 ConfigMap 提供，避免定制镜像）
+                - name: backup-script
+                  mountPath: /usr/local/bin/backup_postgres.sh
+                  subPath: backup_postgres.sh
+          volumes:
+            - name: backupdata
+              persistentVolumeClaim:
+                claimName: knowagent-backups
+            - name: backup-script
+              configMap:
+                name: knowagent-backup-script
+                defaultMode: 0755
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: knowagent-backups
+  namespace: knowagent
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 20Gi

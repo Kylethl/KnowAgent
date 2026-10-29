@@ -1,0 +1,40 @@
+# 非敏感配置（P7：模型名 / 日志格式 / 限流阈值 / 数据不出域开关）
+# ---------------------------------------------------------------------
+# 敏感项（API Key、JWT、DB 口令）放 secret.yaml，不要写进 ConfigMap。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: knowagent-config
+  namespace: knowagent
+data:
+  # 应用
+  APP_ENV: "production"
+  APP_NAME: "KnowAgent API"
+  # 日志（生产用 JSON，供 Loki/ELK 采集）
+  LOG_FORMAT: "json"
+  LOG_LEVEL: "INFO"
+  # 模型（公有云 DeepSeek + 千问；私有化时改成本地/合规云地址）
+  DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+  DEEPSEEK_MODEL: "deepseek-flash"
+  QWEN_EMBEDDING_MODEL: "qwen3.7-text-embedding-flash"
+  MEDIA_OCR_MODEL: "qwen3.5-ocr"
+  MEDIA_ASR_MODEL: "qwen3.8-omni-flash"
+  MEDIA_EXTRACT_ENABLED: "true"
+  # LLM 限流
+  LLM_RATE_LIMIT_ENABLED: "true"
+  LLM_RATE_LIMIT_PER_MINUTE: "20"
+  LLM_RATE_LIMIT_PER_DAY: "300"
+  LLM_DAILY_TOKEN_QUOTA: "200000"
+  # 监控
+  METRICS_ENABLED: "true"
+  # 数据不出域：私有化设为 strict，配合 secret 中的 OUTBOUND_ALLOWED_HOSTS
+  DATA_RESIDENCY_MODE: "standard"
+  DATA_REGION: "cn"
+  # 审计
+  AUDIT_ENABLED: "true"
+  AUDIT_RETENTION_DAYS: "180"
+  # 备份（应用内置 beat 关闭，用独立 CronJob）
+  BACKUP_ENABLED: "false"
+  # 存储
+  STORAGE_BACKEND: "local"
+  STORAGE_LOCAL_DIR: "/app/data/uploads"

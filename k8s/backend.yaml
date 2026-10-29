@@ -1,0 +1,89 @@
+# 后端 FastAPI（P7-Dep2）
+# ---------------------------------------------------------------------
+# Deployment + Service。worker 复用同镜像，见 worker.yaml。
+# 镜像构建：cd backend && docker build -t knowagent-backend:latest .
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowagent-backend
+  namespace: knowagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: knowagent-backend
+  template:
+    metadata:
+      labels:
+        app: knowagent-backend
+      annotations:
+        # 配置变更时滚动重启（取 configmap/secret 的哈希做版本）
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: backend
+          image: knowagent-backend:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: knowagent-config
+            - secretRef:
+                name: knowagent-secret
+          env:
+            - name: CORS_ORIGINS
+              value: "https://knowagent.example.com"
+            - name: AUTH_REQUIRED
+              value: "true"
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/data/uploads
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: knowagent-uploads
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowagent-backend
+  namespace: knowagent
+spec:
+  selector:
+    app: knowagent-backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: knowagent-uploads
+  namespace: knowagent
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources:
+    requests:
+      storage: 20Gi

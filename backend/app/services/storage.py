@@ -419,3 +419,49 @@ def build_storage(settings=None) -> BaseStorage:
 
     # 默认 / 其它值一律走本地目录（最稳妥的零依赖开发后端）
     return LocalStorage(root=settings.STORAGE_LOCAL_DIR)
+
+
+async def probe_backend(settings=None) -> tuple[bool, str]:
+    """探测对象存储是否真的可用（P7：状态页与合规自检使用）。
+
+    为什么不能只看「配置了哪个后端」：
+        MinIO 凭证过期、桶被删、磁盘写满都会让上传在运行时失败，
+        而这些在配置层面完全看不出来。因此这里做一次**真实但无副作用**的探测。
+
+    探测方式（按后端区分）：
+      - local：在目标目录写入并删除一个探针文件（验证目录存在 + 可写）；
+      - minio：调用 bucket_exists（只读，不产生对象）。
+
+    Args:
+        settings: 配置对象；缺省读取全局单例。
+
+    Returns:
+        (是否可用, 说明文案)。
+    """
+    if settings is None:
+        settings = get_settings()
+
+    backend = (settings.STORAGE_BACKEND or "local").strip().lower()
+    try:
+        if backend == "minio":
+            storage = build_storage(settings)
+            # MinIO SDK 是同步的：放到线程池，避免阻塞事件循环
+            exists = await asyncio.to_thread(
+                storage._client.bucket_exists,  # noqa: SLF001 —— 探测需要底层客户端
+                storage.bucket,
+            )
+            if exists:
+                return True, f"MinIO 桶可访问：{storage.bucket}"
+            return False, f"MinIO 桶不存在：{storage.bucket}（请先创建桶）"
+
+        # local 后端：写探针文件再删除
+        storage = build_storage(settings)
+        root = Path(storage.root)  # type: ignore[attr-defined]
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".ops_probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True, f"本地目录可写：{root}"
+    except Exception as exc:  # noqa: BLE001 —— 探测失败只回传原因，不抛
+        return False, f"对象存储不可用：{exc}"
+

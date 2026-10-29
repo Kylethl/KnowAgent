@@ -33,6 +33,8 @@ from ..schemas import (
 )
 from ..services import documents as documents_service
 from ..services import embedding as embedding_mod
+# P7-B2：审计日志（上传动作留痕）
+from ..services import audit_service
 from ..services.documents import UploadValidationError
 from ..services.storage import BaseStorage, StorageError, build_storage
 
@@ -101,6 +103,19 @@ async def upload_document(
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     # 映射 ORM 对象 → 前端契约响应（字段名与 types.ts 的 DocumentRecord 对齐）
+    # P7-B2：上传属于「内容进入知识库」的入口动作，写审计留痕
+    # （只记文件名/类型/大小等元信息，绝不记录文件内容）。
+    await audit_service.record(
+        "document.upload",
+        user_id=current_user_id,
+        resource_type="document",
+        resource_id=str(doc.id),
+        detail={
+            "filename": doc.filename,
+            "file_type": doc.file_type,
+            "size_bytes": doc.size_bytes,
+        },
+    )
     return DocumentUploadResponse(
         id=str(doc.id),
         filename=doc.filename,

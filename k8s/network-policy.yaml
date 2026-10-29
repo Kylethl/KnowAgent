@@ -1,0 +1,102 @@
+# 网络策略（P7-Dep2：网络隔离 / 最小暴露面）
+# ---------------------------------------------------------------------
+# 默认拒绝所有入站流量，仅显式放行必要的服务间通信。
+# 需要集群开启 NetworkPolicy（Calico/Cilium/云厂商 CNI 均支持）。
+#
+# 隔离原则（最小权限）：
+#   - 数据库 / Redis 只允许 backend、worker、backup 访问；
+#   - backend 只接受 frontend 的 /api 流量与监控抓取；
+#   - 前端只接受 ingress 流量；
+#   - 出站「数据不出域」由应用层 egress.py 白名单控制（见需求清单 P7-B2）。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: knowagent-default-deny
+  namespace: knowagent
+spec:
+  podSelector: {}   # 匹配命名空间内所有 Pod
+  policyTypes:
+    - Ingress
+    - Egress
+  # 不写任何 ingress/egress 规则 = 默认拒绝全部
+---
+# PostgreSQL：仅 backend / worker / media-worker / backup 可访问
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-allow
+  namespace: knowagent
+spec:
+  podSelector:
+    matchLabels:
+      app: knowagent-postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - knowagent-backend
+                  - knowagent-worker
+                  - knowagent-media-worker
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# Redis：仅 backend / worker / media-worker 可访问
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-allow
+  namespace: knowagent
+spec:
+  podSelector:
+    matchLabels:
+      app: knowagent-redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - knowagent-backend
+                  - knowagent-worker
+                  - knowagent-media-worker
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# backend：仅前端（/api）与监控抓取可访问
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend-allow
+  namespace: knowagent
+spec:
+  podSelector:
+    matchLabels:
+      app: knowagent-backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: knowagent-frontend
+      ports:
+        - protocol: TCP
+          port: 8000
+    # 监控（Prometheus 抓取 /metrics）放行同命名空间带标签的采集器
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000

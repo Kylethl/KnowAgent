@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ChatMessage, Citation, RetrievalInfo, StreamStatus } from '../types';
 import { startChatStream } from '../services/chatStream';
+import { fetchQuota } from '../services/opsApi';
 
 // P1-F2：对话流式状态钩子
 // 职责：管理消息列表、流式状态、错误；把 SSE 收到的分片放进「打字机队列」，
@@ -133,13 +134,33 @@ export function useChatStream(options: UseChatStreamOptions) {
   /**
    * 发送提问：追加用户消息与空的助手占位消息，建立 SSE 流式连接。
    * 流式过程中禁止重复发送，避免串流。
+   *
+   * P7 增强（配额预检）：
+   *   后端对 /chat 做了限流与配额（每分钟 / 每日 / 每日 token），超限返回 429。
+   *   但本项目的流式协议是 EventSource——浏览器**拿不到 429 的响应体与状态码**，
+   *   用户只会看到「连接失败」，完全不知道是额度用完了还是服务挂了。
+   *   因此在建立流之前先查一次 /chat/quota：
+   *     - 被拒：直接给出后端下发的可读文案（含「明日 00:00 重置」），不建立连接；
+   *     - 查询本身失败：不阻断对话——真正的守门在后端，不能因为预检挂了就不让人提问。
    */
   const sendMessage = useCallback(
-    (text: string) => {
+    async (text: string) => {
       const content = text.trim();
       if (!content) return;
       if (status === 'thinking' || status === 'streaming') return; // 生成中忽略
       setError(null);
+
+      // P7：配额预检（只读，不消耗额度）
+      try {
+        const quota = await fetchQuota();
+        if (quota.enabled && !quota.allowed) {
+          setStatus('error');
+          setError(quota.message || '已达提问额度上限，请稍后再试');
+          return;
+        }
+      } catch {
+        // 预检失败不影响发送：后端会做最终校验（并在 POST /chat 场景返回 429 详情）
+      }
 
       // 用户消息
       const userMsg: ChatMessage = {

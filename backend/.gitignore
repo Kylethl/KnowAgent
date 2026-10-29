@@ -20,3 +20,7 @@ htmlcov/
 
 # 本地上传文件落盘目录（STORAGE_BACKEND=local 时生成；应走 Docker 挂载卷，不入库）
 data/
+
+# 测试与临时产物（P7 引入）
+.pytest_tmp/
+tests/.pytest_p7_work/

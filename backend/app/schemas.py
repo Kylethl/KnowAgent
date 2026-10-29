@@ -596,3 +596,242 @@ class FeedbackSummaryResponse(BaseModel):
 # "FeedbackOut is not defined"（Pydantic v2 对未解析前向引用直接报错）。
 ConversationMessageOut.model_rebuild()
 ConversationDetail.model_rebuild()
+
+
+# =====================================================================
+# P7 生产加固：运维状态 / 审计 / 备份 / 合规（契约）
+# ---------------------------------------------------------------------
+# 契约来源：《需求清单》P7
+#   功能1：监控 / 日志 / 备份 —— 管理端「系统状态」页的数据来源
+#   功能2：合规与私有化部署 —— 审计日志查询 + 合规自检
+#
+# 字段命名与前端 src/types.ts 的 Ops* / AuditLogItem / BackupItem 严格对齐，
+# 不做驼峰转换，避免多次映射出错。
+# =====================================================================
+
+# 依赖检查状态：ok 正常 / degraded 降级可用 / down 不可用 / disabled 未启用
+ServiceStatus = Literal["ok", "degraded", "down", "disabled"]
+
+
+class OpsServiceStatus(BaseModel):
+    """单条依赖检查结果（状态页「依赖健康」表格的一行）。"""
+
+    name: str = Field(..., description="依赖标识：postgres/redis/object_storage/...")
+    label: str = Field(..., description="中文名（展示用）")
+    status: ServiceStatus = Field(..., description="ok / degraded / down / disabled")
+    detail: str = Field("", description="补充说明（成功时是版本，失败时是原因）")
+    latency_ms: Optional[float] = Field(default=None, description="探测耗时（毫秒）")
+
+
+class OpsAppInfo(BaseModel):
+    """应用自身信息（版本、运行时长、可观测能力开关）。"""
+
+    name: str = Field(..., description="应用名称")
+    version: str = Field(..., description="应用版本")
+    env: str = Field(..., description="运行环境：development / production")
+    uptime_seconds: int = Field(0, description="已运行秒数")
+    log_format: str = Field("text", description="日志格式：text / json")
+    log_level: str = Field("INFO", description="当前日志级别")
+    sentry_enabled: bool = Field(False, description="错误上报是否已启用")
+    sentry_sdk_missing: bool = Field(
+        False, description="是否配置了 DSN 但缺少 sentry-sdk（部署缺陷提示）"
+    )
+    metrics_enabled: bool = Field(True, description="是否启用 Prometheus 指标")
+    metrics_backend: str = Field("builtin", description="指标后端：prometheus_client / builtin")
+
+
+class OpsQuotaSnapshot(BaseModel):
+    """当前用户的配额用量快照。"""
+
+    allowed: bool = Field(True, description="现在是否还能提问")
+    scope: str = Field("", description="被拦下的维度：minute / day / tokens")
+    minute_used: int = Field(0, description="本分钟已用次数")
+    minute_limit: int = Field(0, description="每分钟上限")
+    day_used: int = Field(0, description="今日已用次数")
+    day_limit: int = Field(0, description="每日上限")
+    tokens_used: int = Field(0, description="今日已用 token")
+    tokens_quota: int = Field(0, description="每日 token 配额（0=不限）")
+    source: str = Field("memory", description="计数来源：redis / memory / disabled")
+
+
+class OpsLlmInfo(BaseModel):
+    """对话模型与限流配置（状态页「LLM 配额」卡片）。"""
+
+    configured: bool = Field(..., description="是否配置了可用的对话模型 Key")
+    model: str = Field(..., description="对话模型名")
+    rate_limit_enabled: bool = Field(..., description="是否启用限流")
+    rate_limit_per_minute: int = Field(0, description="每分钟次数上限")
+    rate_limit_per_day: int = Field(0, description="每日次数上限")
+    daily_token_quota: int = Field(0, description="每日 token 配额（0=不限）")
+    quota: Optional[OpsQuotaSnapshot] = Field(
+        default=None, description="当前请求者的个人用量（无用户身份时为空）"
+    )
+
+
+class BackupItem(BaseModel):
+    """一个备份文件（状态页「备份」列表的一行）。"""
+
+    name: str = Field(..., description="备份文件名")
+    size_bytes: int = Field(0, description="文件字节数")
+    created_at: str = Field("", description="创建时间（ISO 8601）")
+    sha256: Optional[str] = Field(default=None, description="内容摘要（完整性校验用）")
+    elapsed_ms: Optional[int] = Field(default=None, description="备份耗时（毫秒）")
+    trigger: Optional[str] = Field(default=None, description="触发方式：manual / schedule / cli")
+    operator: Optional[str] = Field(default=None, description="触发者用户名")
+    verified: bool = Field(False, description="是否通过完整性校验")
+    restore_hint: str = Field("", description="恢复命令提示（必须人工执行）")
+    retention_days: int = Field(0, description="当前保留天数")
+
+
+class BackupStatus(BaseModel):
+    """备份能力总览。"""
+
+    enabled: bool = Field(..., description="备份功能是否启用")
+    dir: str = Field("", description="备份目录（绝对路径）")
+    retention_days: int = Field(0, description="按天数保留")
+    retention_count: int = Field(0, description="按个数保留")
+    schedule_hour: int = Field(0, description="每日自动备份时刻（小时）")
+    next_run_hint: Optional[str] = Field(default=None, description="下次预计执行时间（提示用）")
+    last: Optional[BackupItem] = Field(default=None, description="最近一次备份")
+    count: int = Field(0, description="现有备份文件数")
+    total_bytes: int = Field(0, description="备份占用空间（字节）")
+    last_verified: bool = Field(False, description="最近一次备份是否通过校验")
+
+
+class OpsAuditSummary(BaseModel):
+    """审计概览（状态页「审计」卡片）。"""
+
+    total: int = Field(0, description="审计记录总数")
+    today: int = Field(0, description="今日新增条数")
+    failures: int = Field(0, description="近 N 天失败事件数")
+    last_event_at: Optional[str] = Field(default=None, description="最近一条审计时间（ISO 8601）")
+    window_days: int = Field(7, description="统计窗口（天）")
+    top_actions: List[dict] = Field(default_factory=list, description="动作分布（前 8 项）")
+    error: Optional[str] = Field(default=None, description="统计失败原因（正常为空）")
+
+
+class OpsResidencyTarget(BaseModel):
+    """一个出站目标（数据去了哪里）。"""
+
+    purpose: str = Field(..., description="用途：llm / embedding / media")
+    label: str = Field("", description="用途中文名")
+    url: str = Field("", description="目标地址")
+    host: str = Field("", description="目标域名")
+    model: str = Field("", description="使用的模型")
+    local: bool = Field(False, description="是否为本机/内网地址（模型已本地化）")
+    allowed: bool = Field(True, description="在当前策略下是否放行")
+
+
+class OpsResidencyInfo(BaseModel):
+    """数据不出域策略与出站拓扑。"""
+
+    mode: str = Field("standard", description="standard / strict")
+    region: str = Field("", description="数据驻留区域标识")
+    strict: bool = Field(False, description="是否严格模式")
+    allowlist: List[str] = Field(default_factory=list, description="出站域名白名单")
+    targets: List[OpsResidencyTarget] = Field(
+        default_factory=list, description="各能力的出站目标"
+    )
+
+
+class OpsMetricsInfo(BaseModel):
+    """监控指标暴露配置。"""
+
+    enabled: bool = Field(True, description="是否启用 /metrics")
+    path: str = Field("/metrics", description="指标路径")
+    token_required: bool = Field(False, description="是否需要抓取令牌")
+    grafana_url: str = Field("", description="Grafana 面板地址（未配置为空）")
+
+
+class OpsStatusResponse(BaseModel):
+    """GET /ops/status 的响应：管理端状态页的全部数据。"""
+
+    app: OpsAppInfo = Field(..., description="应用信息")
+    services: List[OpsServiceStatus] = Field(
+        default_factory=list, description="依赖健康检查结果"
+    )
+    llm: OpsLlmInfo = Field(..., description="对话模型与限流")
+    backup: BackupStatus = Field(..., description="备份状态")
+    audit: OpsAuditSummary = Field(..., description="审计概览")
+    residency: OpsResidencyInfo = Field(..., description="数据不出域信息")
+    metrics: OpsMetricsInfo = Field(..., description="监控指标配置")
+    generated_at: str = Field("", description="生成时间（ISO 8601）")
+
+
+class AuditLogOut(BaseModel):
+    """单条审计记录（列表项）。"""
+
+    id: str = Field(..., description="审计记录 ID")
+    user_id: Optional[str] = Field(default=None, description="操作者 ID（注销后为空）")
+    username: Optional[str] = Field(default=None, description="操作者用户名快照")
+    role: Optional[str] = Field(default=None, description="操作者角色快照")
+    action: str = Field(..., description="动作代码，如 document.review")
+    action_label: str = Field("", description="动作中文名")
+    resource_type: Optional[str] = Field(default=None, description="资源类型")
+    resource_id: Optional[str] = Field(default=None, description="资源标识")
+    result: str = Field("success", description="success / failure")
+    ip: Optional[str] = Field(default=None, description="来源 IP")
+    request_id: Optional[str] = Field(default=None, description="请求 ID（与访问日志串联）")
+    detail: Optional[dict] = Field(default=None, description="动作细节（已脱敏）")
+    created_at: str = Field("", description="发生时间（ISO 8601）")
+
+
+class AuditLogListResponse(BaseModel):
+    """GET /ops/audit-logs 的响应：当前页 + 总数。"""
+
+    items: List[AuditLogOut] = Field(default_factory=list, description="当前页审计记录")
+    total: int = Field(0, description="满足条件的总条数")
+    limit: int = Field(50, description="每页条数")
+    offset: int = Field(0, description="当前偏移量")
+
+
+class AuditActionOption(BaseModel):
+    """审计动作筛选项。"""
+
+    value: str = Field(..., description="动作代码")
+    label: str = Field(..., description="中文名")
+
+
+class ComplianceItem(BaseModel):
+    """一条合规自检项。"""
+
+    key: str = Field(..., description="检查项标识")
+    title: str = Field(..., description="检查项名称")
+    category: str = Field(..., description="分类：数据合规 / 审计 / 访问控制 / 暴露面 / 业务连续性")
+    status: str = Field(..., description="pass / warn / fail")
+    detail: str = Field("", description="当前实际状态说明")
+    hint: str = Field("", description="不通过时的修复建议")
+
+
+class ComplianceReport(BaseModel):
+    """GET /ops/compliance 的响应：合规自检报告。"""
+
+    generated_at: str = Field("", description="生成时间（ISO 8601）")
+    mode: str = Field("standard", description="数据不出域模式")
+    region: str = Field("", description="数据驻留区域")
+    summary: dict = Field(default_factory=dict, description="汇总：{pass, warn, fail}")
+    items: List[ComplianceItem] = Field(default_factory=list, description="检查项列表")
+
+
+class QuotaResponse(BaseModel):
+    """GET /chat/quota 的响应：当前用户的配额余量。
+
+    为什么单独提供该接口：
+        前端用 EventSource 建立 SSE 连接，**拿不到 429 的响应体与状态码**
+        （EventSource 的 onerror 只有事件、没有 detail）。若只在 /chat 上拦截，
+        用户只会看到「连接被拒」而不知道原因。因此前端可以先花一次轻量请求
+        问「我还能不能问」，被拒时直接展示可读文案，不再建立流。
+    """
+
+    enabled: bool = Field(True, description="是否启用限流")
+    allowed: bool = Field(True, description="现在是否可以提问")
+    scope: str = Field("", description="被拦下的维度：minute / day / tokens")
+    message: str = Field("", description="被拒时的可读说明")
+    retry_after: int = Field(0, description="建议等待秒数")
+    minute_used: int = Field(0, description="本分钟已用")
+    minute_limit: int = Field(0, description="每分钟上限")
+    day_used: int = Field(0, description="今日已用")
+    day_limit: int = Field(0, description="每日上限")
+    tokens_used: int = Field(0, description="今日已用 token")
+    tokens_quota: int = Field(0, description="每日 token 配额")
+

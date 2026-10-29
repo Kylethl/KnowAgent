@@ -1,0 +1,42 @@
+# Prometheus 主配置（P7-Dep1）
+# ---------------------------------------------------------------------
+# 抓取目标：backend 应用指标 + postgres/redis exporter。
+# 修改后热重载：curl -X POST http://localhost:9090/-/reload
+global:
+  scrape_interval: 15s      # 默认 15 秒抓一次
+  evaluation_interval: 15s  # 告警规则 15 秒评估一次
+  # 外部标签：区分集群/环境，多机部署时避免指标冲突
+  external_labels:
+    cluster: knowagent
+    env: production
+
+# 告警规则文件（P7：备份失败、依赖宕机、限流激增、错误率飙升）
+rule_files:
+  - "/etc/prometheus/alerts.yml"
+
+scrape_configs:
+  # ---------- 后端 FastAPI 应用指标 ----------
+  # backend 内置 /metrics 输出 knowagent_* 指标（见 app/core/metrics.py）。
+  - job_name: "knowagent-backend"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["backend:8000"]
+    # 若 backend 配置了 METRICS_TOKEN，取消注释并填入相同令牌：
+    # authorization:
+    #   type: Bearer
+    #   credentials: "CHANGE_ME"
+
+  # ---------- PostgreSQL ----------
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # ---------- Redis ----------
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  # ---------- Prometheus 自身 ----------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

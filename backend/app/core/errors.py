@@ -232,3 +232,68 @@ class FeedbackNotAllowed(Exception):
     def __init__(self, message: str = "该消息不支持评价"):
         super().__init__(message)
         self.message = message
+
+
+# =====================================================================
+# 生产加固异常（P7：限流配额 / 备份 / 数据不出域）
+# ---------------------------------------------------------------------
+# 语义约定沿用前文：
+#   限流与配额 → 429（可重试，带 Retry-After）
+#   数据不出域 → 503（配置/合规导致的能力不可用，不是客户端的错）
+#   备份失败   → 500（服务端运维动作失败，需要人工介入）
+# =====================================================================
+
+
+class RateLimitExceeded(Exception):
+    """LLM 调用超出限流或配额（对应 HTTP 429 Too Many Requests）。
+
+    Attributes:
+        scope: 触发的维度——minute（每分钟次数）/ day（每日次数）/ tokens（每日 token）。
+        limit: 该维度的上限值（用于前端展示「上限 20 次/分钟」）。
+        retry_after: 建议等待秒数（写入 Retry-After 响应头，让客户端知道何时可重试）。
+        window: 人类可读的窗口描述（如「每分钟」「今日」）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        scope: str = "minute",
+        limit: int = 0,
+        retry_after: int = 60,
+        window: str = "",
+    ):
+        super().__init__(message)
+        self.message = message
+        self.scope = scope
+        self.limit = limit
+        self.retry_after = retry_after
+        self.window = window
+
+
+class DataResidencyViolation(Exception):
+    """出站调用违反「数据不出域」策略（strict 模式下域名不在白名单）。
+
+    典型场景：strict 模式只允许内网模型网关，但配置里仍指向公网 DeepSeek。
+    上层据此返回 503，并在日志中明确「哪个用途、哪个域名」被拦截。
+    """
+
+    def __init__(self, host: str, purpose: str, message: Optional[str] = None):
+        self.host = host
+        self.purpose = purpose
+        super().__init__(
+            message
+            or f"数据不出域策略拦截：{purpose} 目标 {host} 不在允许的出站域名白名单内"
+        )
+        self.message = str(self)
+
+
+class BackupError(Exception):
+    """备份执行失败（pg_dump 退出码非 0 / 超时 / 文件校验不通过）。
+
+    上层据此返回 500，并把可读原因回传管理员（不含数据库口令）。
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+

@@ -1,0 +1,43 @@
+# 对外入口（P7-Dep2）
+# ---------------------------------------------------------------------
+# 使用 nginx-ingress（cloud/裸机常用）。若集群无 ingress controller，
+# 可改用 frontend Service 的 NodePort 或 LoadBalancer 类型直接暴露。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: knowagent
+  namespace: knowagent
+  annotations:
+    # 前端路由回退 + 上传体积限制
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    # SSE 流式必需：关闭缓冲，超时放宽
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # HTTPS 由 cert-manager 自动签发（需先部署 cert-manager + Issuer）
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - knowagent.example.com
+      secretName: knowagent-tls
+  rules:
+    - host: knowagent.example.com
+      http:
+        paths:
+          # 前端静态 + SPA 回退
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: knowagent-frontend
+                port:
+                  number: 80
+          # API 反代
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: knowagent-backend
+                port:
+                  number: 8000

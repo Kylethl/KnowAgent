@@ -519,6 +519,56 @@ def test_normalize_context_never_empty():
     assert normalize_context("  [1] 资料正文 ") == "[1] 资料正文"
 
 
+def test_compose_rag_system_prompt_forbids_citation_without_context():
+    """零命中时必须切换到「禁止引用编号」的规则集。
+
+    回归用例：曾经无论有无资料都用同一套 RAG_RULES，其中的
+    「引用资料时标注 [n]」是正向指令，模型在资料为空时照样照做，
+    产出「徽标显示未命中、正文却带 [1]」的自相矛盾回答。
+    """
+    prompt = compose_rag_system_prompt("你是知识库助手。", has_context=False)
+
+    # 人设仍在
+    assert "你是知识库助手。" in prompt
+    # 明确禁止编号，而不是「省略规则」——省略仍会被多轮历史模仿
+    assert "不要输出" in prompt and "引用编号" in prompt
+    # 不得再出现正向示范（「……docx 与 md 两种格式[1]」这种例句会被模型当模板抄）
+    assert "两种格式[1]" not in prompt
+    # 仍要求如实说明未命中
+    assert "未找到" in prompt
+
+
+def test_compose_rag_system_prompt_keeps_citation_rules_with_context():
+    """有资料时保持原有引用规则（标注 [n] + 依据资料作答）。"""
+    prompt = compose_rag_system_prompt("你是知识库助手。", has_context=True)
+
+    assert "两种格式[1]" in prompt
+    # 不该出现 no-hit 分支特有的那句禁令
+    assert "这类引用编号" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_stream_answer_switches_rules_on_empty_context(monkeypatch):
+    """端到端串联：context 为空串时，送进链路的 system_prompt 必须是不带引用编号的那套。"""
+    import app.services.chat_chain as chat_chain
+
+    store: dict = {}
+    monkeypatch.setattr(chat_chain, "get_settings", lambda: _LLMSettings())
+    monkeypatch.setattr(chat_chain, "get_rag_chain", lambda: _FakeChain(store))
+
+    _ = [
+        p
+        async for p in chat_chain.stream_answer(
+            "你可以做什么", history=[], meta={}, memory_enabled=False, context=""
+        )
+    ]
+
+    system_prompt = store["inputs"]["system_prompt"]
+    assert "引用编号" in system_prompt      # 已切到 no-hit 规则
+    assert "两种格式[1]" not in system_prompt
+    assert store["inputs"]["context"] == EMPTY_CONTEXT_PLACEHOLDER
+
+
 def test_rag_prompt_renders_context_into_system_message():
     """模板渲染后，资料正文应出现在 system 消息里，human 消息只保留提问。"""
     from app.services.rag_chain import build_rag_prompt

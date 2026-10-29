@@ -1,0 +1,76 @@
+# PostgreSQL + pgvector（P7-Dep2：单副本 + 持久卷）
+# ---------------------------------------------------------------------
+# 使用 pgvector 官方镜像（内置 vector 扩展），与 docker 编排一致。
+# 私有化生产建议：接外部高可用 PG 或云 RDS，本清单用于开箱即用。
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowagent-postgres
+  namespace: knowagent
+spec:
+  selector:
+    app: knowagent-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  # 仅集群内访问（不暴露公网）
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: knowagent-postgres
+  namespace: knowagent
+spec:
+  serviceName: knowagent-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: knowagent-postgres
+  template:
+    metadata:
+      labels:
+        app: knowagent-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: knowagent
+            - name: POSTGRES_DB
+              value: knowagent
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: knowagent-secret
+                  key: POSTGRES_PASSWORD
+            # 首库自动开启 pgvector
+            - name: POSTGRES_INITDB_ARGS
+              value: "--auth-host=scram-sha-256"
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "knowagent"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # 私有化裸机可改 hostPath/local-path；云环境改云盘 StorageClass
+        resources:
+          requests:
+            storage: 20Gi

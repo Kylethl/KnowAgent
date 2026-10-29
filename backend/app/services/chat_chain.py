@@ -30,6 +30,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
 
 from ..config import Settings, get_settings
+from ..core import egress
 from ..core.errors import DeepSeekError, LLMError, LLMNotConfiguredError
 from ..core.logging import get_logger
 from .langchain_memory import HistoryItem, dicts_to_messages, get_memory_store
@@ -121,6 +122,14 @@ async def stream_answer(
     """
     cfg: Settings = get_settings()
 
+    # P7-B2（数据不出域）：在发起任何网络调用之前校验目标域名。
+    # strict 模式下若 DeepSeek 地址不在白名单且非内网，这里直接抛
+    # DataResidencyViolation（由 API 层转成可读提示），绝不把问题数据发出去。
+    # 说明：用 getattr 读 base_url 是为了兼容单测里的配置替身（只提供被断言用到的字段）。
+    base_url = (getattr(cfg, "DEEPSEEK_BASE_URL", "") or "").strip()
+    if base_url:
+        egress.check_outbound(f"{base_url.rstrip('/')}/chat/completions", "llm")
+
     # 1) 前置校验：无可用 Key 时直接进入异常处理路径，由 API 层转成友好提示
     if not cfg.is_deepseek_configured:
         raise LLMNotConfiguredError(
@@ -153,10 +162,15 @@ async def stream_answer(
         "question": question,
     }
     if use_rag:
-        # 增强链：人设 + 引用规则进 system，资料填 context 槽位（无资料时填占位文案）
-        inputs["system_prompt"] = compose_rag_system_prompt(cfg.SYSTEM_PROMPT)
-        inputs["context"] = normalize_context(context)
+        # 增强链：人设 + 规则进 system，资料填 context 槽位（无资料时填占位文案）。
+        # 先判定「本轮是否真有资料」——它同时决定 context 槽位内容与用哪套规则：
+        # 零命中时必须切换到禁止引用编号的规则集，否则模型会凭空标注 [1]，
+        # 与前端「知识库未命中」徽标互相矛盾（详见 rag_chain.RAG_RULES_EMPTY 注释）。
         has_context = bool((context or "").strip())
+        inputs["context"] = normalize_context(context)
+        inputs["system_prompt"] = compose_rag_system_prompt(
+            cfg.SYSTEM_PROMPT, has_context=has_context
+        )
         if meta is not None:
             # 供上层日志/前端区分「基于知识库作答」与「检索无命中后的通用回答」
             meta["rag"] = True
@@ -228,7 +242,13 @@ def chunk_to_text(chunk: Any) -> str:
 
 
 def read_finish_reason(chunk: Any, meta: Optional[dict]) -> None:
-    """读取模型结束原因并写入 meta（用于判断是否被 max_tokens 截断）。
+    """读取模型结束原因与 token 用量并写入 meta。
+
+    - finish_reason 用于判断是否被 max_tokens 截断；
+    - usage 用于 P7 的配额结算（token 维度）与成本看板。
+
+    说明：OpenAI 兼容协议下，usage 通常只在**最后一个** chunk 出现，
+    因此这里每收到一个带 usage 的块就覆盖写入 meta，最终值即本轮总用量。
 
     Args:
         chunk: 链的输出消息块。
@@ -243,6 +263,19 @@ def read_finish_reason(chunk: Any, meta: Optional[dict]) -> None:
         finish_reason = (getattr(chunk, "additional_kwargs", None) or {}).get("finish_reason")
     if finish_reason:
         meta["finish_reason"] = finish_reason
+
+    # P7-B1：LangChain 统一把用量放在 usage_metadata（input_tokens / output_tokens）；
+    # 个别版本仍保留 response_metadata.token_usage，做一次兼容兜底。
+    usage = getattr(chunk, "usage_metadata", None)
+    if usage:
+        meta["prompt_tokens"] = int(usage.get("input_tokens") or 0)
+        meta["completion_tokens"] = int(usage.get("output_tokens") or 0)
+    else:
+        token_usage = response_metadata.get("token_usage") or {}
+        if token_usage:
+            meta["prompt_tokens"] = int(token_usage.get("prompt_tokens") or 0)
+            meta["completion_tokens"] = int(token_usage.get("completion_tokens") or 0)
+
 
 
 def wrap_llm_error(exc: Exception) -> LLMError:

@@ -503,7 +503,14 @@ export default function AdminPage() {
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', background: '#f7f8fa' }}>
       {/* 顶栏：复用对话页顶栏；管理后台不需要上传入口，故不传 onUploadClick。
           传入 onHomeClick 后，点击左上角图标或「知识库问答」即可返回对话页。 */}
-      <TopBar user={user} onLogout={logout} onHomeClick={handleBackToChat} />
+      <TopBar
+        user={user}
+        onLogout={logout}
+        onHomeClick={handleBackToChat}
+        // P7：系统状态入口（监控 / 备份 / 审计 / 合规），仅管理员可见
+        onOpsClick={() => navigate('/ops')}
+      />
+
 
       <main style={{ flex: 1, padding: 24, maxWidth: 1200, width: '100%', margin: '0 auto' }}>
         {/* 标题区：左侧标题，右侧提供显式的「返回对话」入口（与顶栏品牌区等效） */}

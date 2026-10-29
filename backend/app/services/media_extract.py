@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 
 from ..config import get_settings
+from ..core import egress
 from ..core.logging import get_logger
 from ..services import media_types
 
@@ -128,6 +129,10 @@ async def _post_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
     settings = get_settings()
     url = _chat_endpoint()
     last_error: Optional[str] = None
+
+    # P7-B2（数据不出域）：图片与音视频内容同样会离开本域，
+    # 在发起请求前按统一策略校验目标域名（strict 模式下可能直接抛错）。
+    egress.check_outbound(url, "media")
 
     # 两次尝试：多模态调用偶发超时较常见，重试一次能显著降低「入库失败」概率
     for attempt in range(2):

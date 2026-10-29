@@ -1,0 +1,60 @@
+# 知识库问答网站 — 定时备份编排（P7-DB1：PostgreSQL 定期备份）
+# ---------------------------------------------------------------------
+# 定位：与 docker-compose.yml 一起使用的**覆盖文件**，独立跑一个 cron 备份容器。
+#   docker compose -f docker-compose.yml -f docker-compose.backup.yml up -d
+#
+# 为什么用独立容器而不是宿主 cron / Celery beat：
+#   - 应用内置的 Celery beat 也能定时备份（app/tasks/maintenance_tasks.py），
+#     但把「备份」与「应用」解耦更稳健：应用挂了备份仍在跑，反之亦然；
+#   - 备份容器复用 postgres 官方镜像自带的 pg_dump，无需额外安装客户端。
+#
+# 备份产物：写入命名卷 backupdata，宿主机可挂载 NFS / 云盘同步走。
+# 恢复：docker compose exec backup sh scripts/restore_postgres.sh <文件名>（人工二次确认）。
+
+services:
+  # ---------- 定时备份（pg_dump + gzip，保留策略清理） ----------
+  backup:
+    image: postgres:16-alpine
+    container_name: knowagent-backup
+    environment:
+      # 数据库连接（compose 服务名 postgres；口令走环境变量，不进 argv）
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: knowagent
+      PGPASSWORD: ${POSTGRES_PASSWORD:-knowagent}
+      PGDATABASE: knowagent
+      # 保留策略：天数 + 个数双约束
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT:-30}
+      # 每日备份时刻（24h，UTC）
+      BACKUP_HOUR: ${BACKUP_HOUR:-3}
+    volumes:
+      # 备份产物持久化（可替换为宿主机路径 / NFS 挂载）
+      - backupdata:/backups
+      # 备份脚本（本仓库 backend/scripts 下）
+      - ../backend/scripts/backup_postgres.sh:/usr/local/bin/backup.sh:ro
+    # 常驻循环：每小时醒来一次，命中 BACKUP_HOUR 则执行备份 + 清理
+    # （sleep 循环实现 cron，不依赖容器内 crond，避免时区与守护进程差异）
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        trap 'exit 0' TERM INT
+        echo "[backup] 启动，每日 $(printf '%02d' "$BACKUP_HOUR"):00 UTC 备份"
+        while :; do
+          HOUR=$$(date -u +%H)
+          if [ "$${HOUR#0}" = "$${BACKUP_HOUR#0}" ]; then
+            echo "[backup] $$(date -Iseconds) 开始备份"
+            /usr/local/bin/backup.sh || echo "[backup] 备份失败"
+            sleep 3600
+          else
+            sleep 300
+          fi
+        done
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  backupdata:

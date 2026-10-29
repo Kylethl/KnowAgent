@@ -43,21 +43,44 @@ RAG_RULES = """【回答要求】
 4. 不要输出「参考资料」原文全文，只提炼与问题相关的要点；不要提及「编号」「切片」等内部术语之外的技术细节。
 5. 使用简洁、准确的中文回答。"""
 
+# 无资料（no_hit / 检索已执行但零命中）时使用的规则。
+#
+# 为什么必须单独一套：RAG_RULES 第 2 条是「引用资料时标注 [n]」的**正向指令**，
+# 模型在没有任何资料的情况下仍会遵从它，把自己的通用知识编上 [1][2]。
+# 而这些编号在后端 select_citations() 里无法映射（chunks 为空 → 引用列表为空，
+# 不会下发 citations 帧），前端 CitationList 也就不渲染来源卡片——
+# 最终呈现为「徽标说知识库未命中，正文却带着 [1]」的自相矛盾。
+# 因此本分支要**显式禁止**输出引用编号，而不是简单省略规则（省略仍可能被历史模仿）。
+RAG_RULES_EMPTY = """【回答要求】
+1. 本次未检索到任何知识库资料。严禁编造资料来源，也不要输出 [1]、[2]、[3] 这类引用编号。
+2. 必须先明确说明「知识库中未找到相关内容」，再给出你的通用理解，并标注「（以下为通用回答，非知识库内容）」。
+3. 不要声称任何内容「出自知识库」「来自已入库文档」或「根据文档」；涉及本站具体功能与限制时，提示用户以实际页面说明为准。
+4. 不要提及「编号」「切片」「参考资料」等内部术语。
+5. 使用简洁、准确的中文回答。"""
 
-def compose_rag_system_prompt(base_persona: Optional[str] = None) -> str:
-    """拼装 RAG 场景的 system prompt（人设 + 引用规则）。
+
+def compose_rag_system_prompt(
+    base_persona: Optional[str] = None, has_context: bool = True
+) -> str:
+    """拼装 RAG 场景的 system prompt（人设 + 规则）。
 
     Args:
         base_persona: 基础人设（默认取配置的 SYSTEM_PROMPT，与 P1 保持一致）；
             显式传空串时退化为仅含规则。
+        has_context: 本轮是否有可用的知识库资料。
+            - True（默认，保持既有行为）：附加 RAG_RULES，要求依据资料并标注 [n]；
+            - False（检索已执行但零命中）：附加 RAG_RULES_EMPTY，**禁止**输出引用编号。
+              两者不可混用，否则模型会在无资料时凭空产出「未命中却带 [1]」的回答。
 
     Returns:
         供 Prompt 的 {system_prompt} 槽位使用的完整系统提示词。
     """
     cfg = get_settings()
     persona = (base_persona if base_persona is not None else cfg.SYSTEM_PROMPT).strip()
+    # 按「本轮是否真有资料」选择规则集，这是引用编号可信度的前提
+    rules = RAG_RULES if has_context else RAG_RULES_EMPTY
     # 人设与规则之间空一行，便于模型区分「角色」与「硬约束」
-    return f"{persona}\n\n{RAG_RULES}" if persona else RAG_RULES
+    return f"{persona}\n\n{rules}" if persona else rules
 
 
 def build_rag_prompt() -> ChatPromptTemplate:

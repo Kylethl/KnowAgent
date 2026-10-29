@@ -1,0 +1,84 @@
+# Celery worker（文档入库）+ 媒体 worker（OCR/ASR）（P7-Dep2）
+# ---------------------------------------------------------------------
+# 复用 backend 镜像，仅覆盖启动命令。媒体任务 CPU 密集，独立 -c 1 限流。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowagent-worker
+  namespace: knowagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: knowagent-worker
+  template:
+    metadata:
+      labels:
+        app: knowagent-worker
+    spec:
+      containers:
+        - name: worker
+          image: knowagent-backend:latest
+          imagePullPolicy: IfNotPresent
+          # 默认队列：文档解析→切片→embedding→写向量
+          command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "-l", "info", "-Q", "celery", "-c", "2"]
+          envFrom:
+            - configMapRef:
+                name: knowagent-config
+            - secretRef:
+                name: knowagent-secret
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/data/uploads
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: knowagent-uploads
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowagent-media-worker
+  namespace: knowagent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: knowagent-media-worker
+  template:
+    metadata:
+      labels:
+        app: knowagent-media-worker
+    spec:
+      containers:
+        - name: media-worker
+          image: knowagent-backend:latest
+          imagePullPolicy: IfNotPresent
+          # 媒体队列：OCR / ASR，-c 1 避免转码抢 CPU
+          command: ["celery", "-A", "app.tasks.celery_app:celery_app", "worker", "-l", "info", "-Q", "media", "-c", "1"]
+          envFrom:
+            - configMapRef:
+                name: knowagent-config
+            - secretRef:
+                name: knowagent-secret
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/data/uploads
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: knowagent-uploads

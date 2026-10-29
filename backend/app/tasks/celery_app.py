@@ -19,6 +19,7 @@
 #     .enqueue_index_document），保证本地无 Redis 也能跑通入库闭环。
 
 from celery import Celery
+from celery.schedules import crontab
 
 from ..config import get_settings
 from ..core.logging import get_logger
@@ -32,6 +33,14 @@ celery_app = Celery(
     "knowagent",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    # P7 修复：显式声明任务模块。
+    # 为什么必须写在这里：worker 启动时只导入本模块（-A app.tasks.celery_app:celery_app），
+    # 若任务模块没被 include，worker 收到消息会报 "Received unregistered task"——
+    # 表现为「任务投递成功但永远不执行」，是排查成本极高的一类故障。
+    include=[
+        "app.tasks.indexing_tasks",
+        "app.tasks.maintenance_tasks",
+    ],
 )
 
 celery_app.conf.update(
@@ -67,3 +76,35 @@ logger.debug(
     settings.CELERY_BROKER_URL,
     settings.CELERY_RESULT_BACKEND,
 )
+
+
+# ---------------------------------------------------------------------
+# 定时任务编排（P7-DB1 / P7-Dep1：定时备份与保留清理）
+# ---------------------------------------------------------------------
+# 启动 beat（与 worker 分开跑，生产建议单副本）：
+#   celery -A app.tasks.celery_app:celery_app beat -l info
+#
+# 时间安排（错开执行，避免备份 IO 与清理任务互相拖慢）：
+#   03:00  数据库备份（BACKUP_SCHEDULE_HOUR 可配）
+#   03:40  备份保留清理（等备份写完再删旧的，避免边删边占 IO）
+#   04:10  审计日志过期清理（低频、量小）
+_beat_schedule = {}
+if settings.BACKUP_ENABLED:
+    _beat_schedule["p7-daily-database-backup"] = {
+        "task": "maintenance.backup_database",
+        # crontab 使用 celery 配置的时区（见上方 timezone=Asia/Shanghai）
+        "schedule": crontab(hour=settings.BACKUP_SCHEDULE_HOUR, minute=0),
+    }
+    _beat_schedule["p7-prune-old-backups"] = {
+        "task": "maintenance.prune_backups",
+        "schedule": crontab(hour=settings.BACKUP_SCHEDULE_HOUR, minute=40),
+    }
+if settings.AUDIT_ENABLED:
+    _beat_schedule["p7-prune-audit-logs"] = {
+        "task": "maintenance.prune_audit_logs",
+        "schedule": crontab(hour=4, minute=10),
+    }
+
+celery_app.conf.beat_schedule = _beat_schedule
+logger.debug("已注册定时任务：%s", ", ".join(_beat_schedule.keys()) or "(无)")
+

@@ -4,6 +4,7 @@ import zhCN from 'antd/locale/zh_CN';
 import ChatPage from './pages/ChatPage';
 import LoginPage from './pages/LoginPage';
 import AdminPage from './pages/AdminPage';
+import OpsPage from './pages/OpsPage';
 import RequireAuth from './components/RequireAuth';
 import RequireAdmin from './components/RequireAdmin';
 import { AuthProvider } from './hooks/useAuth';
@@ -21,6 +22,12 @@ import { AuthProvider } from './hooks/useAuth';
 //   /admin  管理员审核后台，由 <RequireAuth> + <RequireAdmin> 双重守卫——
 //           未登录跳 /login，已登录但非管理员展示 403 无权限页。
 //           （真正的权限裁决在后端 require_admin，前端守卫仅为体验优化。）
+//
+// P7 新增：
+//   /ops    系统状态页（监控 / 备份 / 审计 / 合规自检），同样双重守卫。
+//           放在独立路由而不是塞进 /admin 的原因：
+//             「审核内容」与「运维系统」是两类工作，混在一个页面会让
+//             日常审核动线被一堆监控卡片打断；分开也便于按角色单独授权。
 //
 // 层级说明：<AuthProvider> 内部要用 useNavigate（401 时跳登录页），
 //          因此必须放在 <BrowserRouter> **内部**。
@@ -57,6 +64,17 @@ export default function App() {
                 <RequireAuth>
                   <RequireAdmin>
                     <AdminPage />
+                  </RequireAdmin>
+                </RequireAuth>
+              }
+            />
+            {/* P7：系统状态页（监控 / 备份 / 审计 / 合规），仅管理员 */}
+            <Route
+              path="/ops"
+              element={
+                <RequireAuth>
+                  <RequireAdmin>
+                    <OpsPage />
                   </RequireAdmin>
                 </RequireAuth>
               }

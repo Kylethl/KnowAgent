@@ -532,3 +532,106 @@ Index(
     Feedback.__table__.c.rating,
     Feedback.__table__.c.created_at.desc(),
 )
+
+
+# =====================================================================
+# P7 生产加固：审计日志（合规）
+# ---------------------------------------------------------------------
+# 对应 sql/009_p7_audit_logs.sql。
+#
+# 设计要点（与 SQL 文件一一对应，改一处必须同步另一处）：
+#   1. username / role 是**快照**——历史审计必须反映「当时是谁、以什么身份」，
+#      不能 JOIN users 实时取值，否则用户改名/提权会改写历史事实。
+#   2. user_id 外键为 ON DELETE SET NULL——账号注销后审计记录**不随之消失**，
+#      这是合规（等保/审计留档）的硬要求。
+#   3. resource_type + resource_id 用「类型 + 字符串 ID」而不是多个外键：
+#      审计对象可能是文档、消息、备份文件、配置项，不可能为每种对象建列。
+#   4. detail 用 JSONB 存动作细节，写入前由 service 层做敏感字段脱敏。
+# =====================================================================
+
+
+class AuditLog(Base):
+    """审计日志表（P7-B2）：记录「谁、在什么时候、对什么、做了什么、结果如何」。
+
+    与普通日志的分工：
+      - 普通日志（core/logging.py）面向**排障**：请求路径、耗时、异常栈；
+      - 审计日志面向**合规举证**：只记敏感动作，结构稳定、可长期保留、可检索。
+
+    因此本表刻意不记录请求体/响应体，只记录动作与结果元信息。
+    """
+
+    __tablename__ = "audit_logs"
+
+    # 主键：数据库侧生成，避免应用时钟不一致导致的排序问题
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    # 操作者 ID：账号注销后置空（审计记录保留）
+    user_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # 操作者用户名快照（未登录的失败登录尝试为空）
+    username: Mapped[Optional[str]] = mapped_column(String(64))
+    # 操作者角色快照：user / admin / anonymous
+    role: Mapped[Optional[str]] = mapped_column(String(16))
+    # 动作代码：点号分层，如 auth.login / document.review / ops.backup.trigger
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    # 资源类型：document / message / user / backup / audit / config / llm
+    resource_type: Mapped[Optional[str]] = mapped_column(String(32))
+    # 资源标识（字符串以兼容 UUID 之外的资源，如备份文件名）
+    resource_id: Mapped[Optional[str]] = mapped_column(String(128))
+    # 结果：success / failure（与 SQL 的 CHECK 约束一致）
+    result: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default=text("'success'")
+    )
+    # 来源信息：用于与访问日志 / Sentry 事件串联
+    ip: Mapped[Optional[str]] = mapped_column(String(64))
+    user_agent: Mapped[Optional[str]] = mapped_column(String(512))
+    request_id: Mapped[Optional[str]] = mapped_column(String(64))
+    # 动作细节（已脱敏）：如 {"previous": "pending", "current": "approved"}
+    detail: Mapped[Optional[dict]] = mapped_column(JSONB(none_as_null=True))
+    # 发生时间：审计的核心排序与筛选字段
+    created_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AuditLog id={self.id} action={self.action!r} "
+            f"user={self.username!r} result={self.result!r}>"
+        )
+
+
+# 结果取值约束：与 009 SQL 的 ck_audit_logs_result 一致，
+# 保证 create_all 与 SQL 脚本生成同一结构
+AuditLog.__table__.append_constraint(
+    CheckConstraint(
+        AuditLog.__table__.c.result.in_(["success", "failure"]),
+        name="ck_audit_logs_result",
+    )
+)
+# 列表主索引：管理端按时间倒序分页
+Index("idx_audit_logs_created_at", AuditLog.__table__.c.created_at.desc())
+# 按动作筛选：合规检查常问「审核动作最近做了哪些」
+Index(
+    "idx_audit_logs_action_created",
+    AuditLog.__table__.c.action,
+    AuditLog.__table__.c.created_at.desc(),
+)
+# 按用户追溯
+Index(
+    "idx_audit_logs_user_created",
+    AuditLog.__table__.c.user_id,
+    AuditLog.__table__.c.created_at.desc(),
+)
+# 按资源追溯
+Index(
+    "idx_audit_logs_resource",
+    AuditLog.__table__.c.resource_type,
+    AuditLog.__table__.c.resource_id,
+)
+

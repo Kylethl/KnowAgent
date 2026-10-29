@@ -31,6 +31,7 @@ from typing import List
 import httpx
 
 from ..config import get_settings
+from ..core import egress
 from ..core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -228,6 +229,9 @@ async def _call_qwen_batch(texts: List[str]) -> List[List[float]]:
         parse = lambda data: _parse_response(data, len(texts))
 
     last_error: Exception | None = None
+    # P7-B2（数据不出域）：向量接口会把**文档正文**送出本域，必须先过合规校验。
+    # 校验放在循环外：被拦截属于配置问题，重试没有意义。
+    egress.check_outbound(url, "embedding")
     # 简单线性退避重试：第 n 次失败后等待 0.5*(n+1) 秒
     for attempt in range(settings.EMBEDDING_MAX_RETRIES + 1):
         try:
