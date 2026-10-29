@@ -36,6 +36,7 @@ LLM_DURATION = "knowagent_llm_request_duration_seconds"
 LLM_TOKENS_TOTAL = "knowagent_llm_tokens_total"
 LLM_RATE_LIMITED_TOTAL = "knowagent_llm_rate_limited_total"
 RAG_RETRIEVAL_TOTAL = "knowagent_rag_retrieval_total"
+CITATION_INVALID_TOTAL = "knowagent_citation_invalid_total"
 DEPENDENCY_UP = "knowagent_dependency_up"
 AUDIT_EVENTS_TOTAL = "knowagent_audit_events_total"
 BACKUP_LAST_SUCCESS = "knowagent_backup_last_success_timestamp_seconds"
@@ -248,6 +249,12 @@ def _init_backend() -> None:
                 ["mode"],
                 registry=registry,
             ),
+            # 不带 label：这里只关心「编引用的次数」，按会话/文档拆分会把基数放大且无价值
+            "citation_invalid": Counter(
+                CITATION_INVALID_TOTAL,
+                "回答正文出现无法映射到引用列表的来源编号的次数（幻觉引用）",
+                registry=registry,
+            ),
             "dependency_up": Gauge(
                 DEPENDENCY_UP,
                 "依赖是否可用（1=可用，0=不可用）",
@@ -416,6 +423,19 @@ def inc_rag(mode: str) -> None:
         _prom["rag"].labels(mode=mode).inc()
     elif _fallback is not None:
         _fallback.inc(RAG_RETRIEVAL_TOTAL, {"mode": mode})
+
+
+def inc_citation_invalid() -> None:
+    """记录一次「幻觉引用」：正文标的编号在引用列表里找不到对应项。
+
+    调用点在 services/citation_guard.guard_answer()，判定逻辑也在那里。
+    指标持续 > 0 说明模型在无资料或越界时仍然编造来源，需要回看 Prompt 与检索质量。
+    """
+    _init_backend()
+    if _prom is not None:
+        _prom["citation_invalid"].inc()
+    elif _fallback is not None:
+        _fallback.inc(CITATION_INVALID_TOTAL, {})
 
 
 def set_dependency(dependency: str, up: bool) -> None:

@@ -36,6 +36,10 @@ from ..core.logging import get_logger
 from ..db.models import Document, DocumentChunk
 from . import embedding as embedding_mod
 from . import retrieval_cache
+# 引用标注的正则统一由 citation_guard 维护（单一事实来源）：
+# 同一套规则既用于「挑引用卡片」，也用于「一致性校验」；
+# 两处各自 compile 一份迟早会漂移（例如一边加了全角括号、另一边没加）。
+from .citation_guard import CITATION_PATTERN as _CITATION_PATTERN
 
 logger = get_logger(__name__)
 
@@ -525,8 +529,8 @@ def build_citations(chunks: List[RetrievedChunk]) -> List[Dict[str, Any]]:
 
 
 # 回答中的引用标注：[1] / ［1］ / [1][3] / [1,3]（含中文逗号）都要能识别。
-# 说明：模型偶尔会用全角方括号，这里一并兼容，否则会漏判「已引用」。
-_CITATION_PATTERN = re.compile(r"[\[［]\s*(\d{1,3}(?:\s*[,，]\s*\d{1,3})*)\s*[\]］]")
+# 模式本身定义在 services/citation_guard.py（见文件头导入），此处不再重复 compile。
+
 
 
 def extract_cited_indices(answer: str, max_index: int) -> List[int]:

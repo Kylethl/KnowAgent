@@ -474,13 +474,18 @@ async def test_stream_answer_uses_generic_chain_without_context(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_answer_marks_empty_context_as_rag(monkeypatch):
-    """context 为空串（检索无命中）仍走增强链，且 meta 标记「无资料」。"""
+async def test_stream_answer_routes_empty_context_to_generic_chain(monkeypatch):
+    """context 为空串（检索无命中）改走**通用链** + 无资料规则。
+
+    回归用例：旧实现零命中仍进增强链，只能往【参考资料】槽位塞一句占位文案，
+    模型于是把通用知识当资料内容并标上编号（「未命中却带 [1]」）。
+    现在资料区整个不存在，从结构上消除这种可能。
+    """
     import app.services.chat_chain as chat_chain
 
     store: dict = {}
     monkeypatch.setattr(chat_chain, "get_settings", lambda: _LLMSettings())
-    monkeypatch.setattr(chat_chain, "get_rag_chain", lambda: _FakeChain(store))
+    monkeypatch.setattr(chat_chain, "get_chat_chain", lambda: _FakeChain(store))
 
     meta: dict = {}
     _ = [
@@ -490,8 +495,15 @@ async def test_stream_answer_marks_empty_context_as_rag(monkeypatch):
         )
     ]
 
-    # 空上下文被替换为占位文案，避免 Prompt 出现空白资料区
-    assert store["inputs"]["context"] == EMPTY_CONTEXT_PLACEHOLDER
+    # 通用链的模板没有 context 槽位：本轮输入里不该出现该键
+    assert "context" not in store["inputs"]
+    system_prompt = store["inputs"]["system_prompt"]
+    assert "本次没有检索到任何知识库资料" in system_prompt
+    assert "未找到" in system_prompt
+    # 无资料规则里不得出现任何编号示例，也不得出现【参考资料】区
+    assert "[1]" not in system_prompt
+    assert "【参考资料】" not in system_prompt
+    # meta 语义保持不变：检索参与了（rag=True）、但没取到资料
     assert meta["rag"] is True
     assert meta["rag_has_context"] is False
 
@@ -520,41 +532,48 @@ def test_normalize_context_never_empty():
 
 
 def test_compose_rag_system_prompt_forbids_citation_without_context():
-    """零命中时必须切换到「禁止引用编号」的规则集。
+    """零命中时必须切换到「禁止来源标注」的规则集。
 
     回归用例：曾经无论有无资料都用同一套 RAG_RULES，其中的
-    「引用资料时标注 [n]」是正向指令，模型在资料为空时照样照做，
+    「引用资料时标注 [n]」是正向指令（还自带例句），模型在资料为空时照样照做，
     产出「徽标显示未命中、正文却带 [1]」的自相矛盾回答。
     """
     prompt = compose_rag_system_prompt("你是知识库助手。", has_context=False)
 
     # 人设仍在
     assert "你是知识库助手。" in prompt
-    # 明确禁止编号，而不是「省略规则」——省略仍会被多轮历史模仿
-    assert "不要输出" in prompt and "引用编号" in prompt
-    # 不得再出现正向示范（「……docx 与 md 两种格式[1]」这种例句会被模型当模板抄）
-    assert "两种格式[1]" not in prompt
+    # 明确禁止来源标注，而不是「省略规则」——省略仍会被多轮历史模仿
+    assert "不要输出" in prompt and "来源标注" in prompt
+    # 规则里不能出现任何编号示例（连反例都不行：出现目标串就会诱发模仿）
+    assert "[1]" not in prompt
+    assert "两种格式" not in prompt
+    # 也不该出现【参考资料】区，否则又回到「有资料区却没资料」的矛盾结构
+    assert "【参考资料】" not in prompt
     # 仍要求如实说明未命中
     assert "未找到" in prompt
 
 
 def test_compose_rag_system_prompt_keeps_citation_rules_with_context():
-    """有资料时保持原有引用规则（标注 [n] + 依据资料作答）。"""
+    """有资料时保留引用规则（依据资料作答 + 标注编号），且示例只给格式不给事实。"""
     prompt = compose_rag_system_prompt("你是知识库助手。", has_context=True)
 
-    assert "两种格式[1]" in prompt
+    assert "方括号标注来源编号" in prompt
+    assert "[1][3]" in prompt
+    # 关键回归：Prompt 里不得出现「docx 与 md」这种具体产品事实——
+    # 模型会把它当成可复述的内容，零命中时也照样吐出来并配上一个编号。
+    assert "docx" not in prompt
     # 不该出现 no-hit 分支特有的那句禁令
-    assert "这类引用编号" not in prompt
+    assert "本次没有检索到" not in prompt
 
 
 @pytest.mark.asyncio
 async def test_stream_answer_switches_rules_on_empty_context(monkeypatch):
-    """端到端串联：context 为空串时，送进链路的 system_prompt 必须是不带引用编号的那套。"""
+    """端到端串联：context 为空串时，送进链路的 system_prompt 必须是不带引用示例的那套。"""
     import app.services.chat_chain as chat_chain
 
     store: dict = {}
     monkeypatch.setattr(chat_chain, "get_settings", lambda: _LLMSettings())
-    monkeypatch.setattr(chat_chain, "get_rag_chain", lambda: _FakeChain(store))
+    monkeypatch.setattr(chat_chain, "get_chat_chain", lambda: _FakeChain(store))
 
     _ = [
         p
@@ -564,9 +583,9 @@ async def test_stream_answer_switches_rules_on_empty_context(monkeypatch):
     ]
 
     system_prompt = store["inputs"]["system_prompt"]
-    assert "引用编号" in system_prompt      # 已切到 no-hit 规则
-    assert "两种格式[1]" not in system_prompt
-    assert store["inputs"]["context"] == EMPTY_CONTEXT_PLACEHOLDER
+    assert "来源标注" in system_prompt      # 已切到 no-hit 规则
+    assert "【参考资料】" not in system_prompt
+    assert "context" not in store["inputs"]
 
 
 def test_rag_prompt_renders_context_into_system_message():

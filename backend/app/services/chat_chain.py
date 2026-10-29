@@ -18,9 +18,12 @@
 #
 # P4 扩展（RAG 检索增强）：
 #   本模块仍是**唯一的流式消费实现**——检索增强只是「换一条 Prompt 结构不同的链」，
-#   stream_answer(..., context=...) 为 None 时走通用链（P1/P2 行为不变），
-#   非 None 时走 services/rag_chain.py 的增强链（资料 + 引用规则进 system）。
-#   这样既满足《需求清单》「生成链（LangChain）」的要求，也避免流式逻辑被复制两份。
+#   stream_answer(..., context=...) 按三种情况分流：
+#     - None      → 通用链（未启用检索，P1/P2 行为不变）；
+#     - 非空文本  → services/rag_chain.py 的增强链（资料 + 引用编号规则进 system）；
+#     - 空串      → 检索执行了但零命中：仍走**通用链**，但换成 NO_HIT_RULES 规则集。
+#   零命中之所以不进增强链：它的模板必须带【参考资料】区，只能填占位文案，
+#   反而诱导模型把通用知识当资料编号（历史缺陷「未命中却带 [n]」的根因）。
 
 from functools import lru_cache
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -35,7 +38,12 @@ from ..core.errors import DeepSeekError, LLMError, LLMNotConfiguredError
 from ..core.logging import get_logger
 from .langchain_memory import HistoryItem, dicts_to_messages, get_memory_store
 from .llm import get_chat_model
-from .rag_chain import compose_rag_system_prompt, get_rag_chain, normalize_context
+from .rag_chain import (
+    compose_no_hit_system_prompt,
+    compose_rag_system_prompt,
+    get_rag_chain,
+    normalize_context,
+)
 
 logger = get_logger(__name__)
 
@@ -99,7 +107,8 @@ async def stream_answer(
            本函数不再读写内存记忆，避免「内存 + 数据库」双写导致上下文错乱；
       3. 读出会话历史，与 system / question 一起喂给 LangChain 链：
          - context 为 None（无检索，P1/P2 行为）→ 通用对话链；
-         - context 非 None（P4 检索增强）→ 增强链，资料与引用规则进入 system；
+         - context 非空（P4 检索增强）→ 增强链，资料与引用规则进入 system；
+         - context 为空串（检索了但零命中）→ 通用链 + NO_HIT_RULES（禁止引用编号）；
       4. 流式产出增量文本；同时把 finish_reason 写入 meta 供上层判断是否被截断；
       5. memory_enabled=True 时，正常结束后把本轮「用户提问 + 助手回答」写回记忆。
 
@@ -111,7 +120,8 @@ async def stream_answer(
         memory_enabled: 是否启用 LangChain 内存记忆。P2 会话落库后应置 False，由数据库管理历史。
         context: P4 检索增强用的参考资料文本。
             None  表示本轮不启用检索（走 P1/P2 的通用链）；
-            空串  表示「检索已执行但无命中」，仍走增强链，由 Prompt 引导模型如实说明。
+            空串  表示「检索已执行但零命中」：走通用链并切换到 NO_HIT_RULES，
+                  明确要求模型声明未命中、且不得输出任何来源编号。
 
     Yields:
         模型增量输出的文本片段。
@@ -155,37 +165,52 @@ async def stream_answer(
         session_id = conversation_id or "db"
         history_messages = dicts_to_messages(history) if history else []
 
-    # 3) 组装本轮输入：P4 起按是否带上下文选择「通用链 / 增强链」
-    use_rag = context is not None
+    # 3) 组装本轮输入：按「本轮是否真有资料」三路分流
+    #    a) 有资料        → 增强链（system 内含【参考资料】区 + 引用编号规则）
+    #    b) 检索了但零命中 → 通用链 + 无资料规则（**不进增强链**，见下方注释）
+    #    c) 未启用检索    → 通用链 + 原始人设（P1/P2 行为，保持完全不变）
+    has_context = bool((context or "").strip())
     inputs: Dict[str, Any] = {
         "history": history_messages,
         "question": question,
     }
-    if use_rag:
-        # 增强链：人设 + 规则进 system，资料填 context 槽位（无资料时填占位文案）。
-        # 先判定「本轮是否真有资料」——它同时决定 context 槽位内容与用哪套规则：
-        # 零命中时必须切换到禁止引用编号的规则集，否则模型会凭空标注 [1]，
-        # 与前端「知识库未命中」徽标互相矛盾（详见 rag_chain.RAG_RULES_EMPTY 注释）。
-        has_context = bool((context or "").strip())
+    if has_context:
+        # 正常命中：资料进 context 槽位，人设 + 引用规则进 system
         inputs["context"] = normalize_context(context)
-        inputs["system_prompt"] = compose_rag_system_prompt(
-            cfg.SYSTEM_PROMPT, has_context=has_context
-        )
+        inputs["system_prompt"] = compose_rag_system_prompt(cfg.SYSTEM_PROMPT)
         if meta is not None:
             # 供上层日志/前端区分「基于知识库作答」与「检索无命中后的通用回答」
             meta["rag"] = True
-            meta["rag_has_context"] = has_context
+            meta["rag_has_context"] = True
         chain = get_rag_chain()
+        chain_name = "RAG 增强链"
+    elif context is not None:
+        # 零命中：检索确实执行了，但一段资料都没有。
+        #
+        # 这里**故意不走增强链**。增强链的模板固定带【参考资料】区，零命中时只能塞一句
+        # 占位文案；模型看到「资料区 + 必须标注来源编号」这套结构，就会把自己的通用知识
+        # 当成资料内容并编号，产出「徽标说未命中、正文却带 [n]」的矛盾回答（历史缺陷）。
+        # 改用通用链后，模板里根本没有资料区，配合 NO_HIT_RULES 显式禁止编号，
+        # 属于结构层面的修复，而不是靠一句提示词去说服模型。
+        inputs["system_prompt"] = compose_no_hit_system_prompt(cfg.SYSTEM_PROMPT)
+        if meta is not None:
+            # rag=True 表示「检索链路参与了本轮决策」，rag_has_context=False 表示没取到资料；
+            # 两者组合即前端的「知识库未命中」徽标，语义不变。
+            meta["rag"] = True
+            meta["rag_has_context"] = False
+        chain = get_chat_chain()
+        chain_name = "通用链（检索零命中）"
     else:
-        # 通用链：保持 P1 行为完全不变（RAG 关闭或降级时走这里）
+        # 未启用检索（RAG 关闭 / 降级 / 无数据库）：保持 P1 行为完全不变
         inputs["system_prompt"] = cfg.SYSTEM_PROMPT
         if meta is not None:
             meta["rag"] = False
         chain = get_chat_chain()
+        chain_name = "通用链（未启用检索）"
 
     logger.info(
         "开始流式回答（%s）：conversation_id=%s，历史消息数=%d，memory_enabled=%s，资料长度=%d",
-        "RAG 增强链" if use_rag else "通用链",
+        chain_name,
         session_id,
         len(history_messages),
         memory_enabled,

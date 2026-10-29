@@ -61,6 +61,7 @@ from ..db.engine import SessionLocal
 from ..schemas import ChatMessage, ChatRequest, QuotaResponse
 from ..services import conversation_service as svc
 from ..services.chat_chain import stream_answer
+from ..services.citation_guard import guard_answer
 from ..services.retriever import retrieve_for_chat, select_citations
 
 logger = get_logger(__name__)
@@ -353,6 +354,14 @@ async def _event_generator(
             # 回答为空（生成失败 / 客户端中断）时不下发引用：
             # 否则会把「一段资料」附在一句「[回答失败]」下面，看起来像是该失败回答的来源。
             citations = select_citations(retrieval.chunks, full_answer) if full_answer else []
+
+            # P4-B2 守卫：校验「正文出现过的每个编号 ⊆ citations 中的编号」这条不变量。
+            # 不通过说明模型编了引用（零命中或越界时最容易发生），这里**只上报不改写**：
+            # 流式 token 早已推给前端，事后剥离救不了当次页面，
+            # 真正的修复在生成前分流（见 chat_chain 的三路分支）。指标告警见 metrics。
+            if full_answer:
+                guard_answer(full_answer, citations)
+
             if citations:
                 # 引用帧：前端用它渲染「回答下方」的引用卡片（P4-F2）。
                 # 放在 [DONE] 之前、正文之后，不打断流式渲染。

@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "_comment": "RAG 回答契约评测集：断言的是「回答的形态」，不是具体措辞。forbid_patterns 用正则，且只匹配「断言式」句式，避免把模型正常否认（如「知识库中没有已入库的资料」）误判为违规。",
+  "cases": [
+    {
+      "id": "no_hit_capability",
+      "question": "你可以帮我做什么",
+      "expect": "no_hit",
+      "require_patterns": [
+        "未找到"
+      ],
+      "forbid_patterns": [
+        "(基于|根据|来自|出自)[^。！？]{0,20}已入库",
+        "出自知识库",
+        "来自知识库"
+      ],
+      "_why": "本次线上缺陷的原始问题：模糊提问检索不到任何切片，模型却编了 [1] 并声称内容来自已入库文档。"
+    },
+    {
+      "id": "no_hit_weather",
+      "question": "今天天气怎么样",
+      "expect": "no_hit",
+      "require_patterns": [
+        "未找到"
+      ],
+      "forbid_patterns": [
+        "(基于|根据|来自|出自)[^。！？]{0,20}已入库",
+        "出自知识库",
+        "来自知识库"
+      ],
+      "_why": "与知识库完全无关的问题，必须稳定走「未命中 + 通用回答」，不能带来源编号。"
+    },
+    {
+      "id": "no_hit_poem",
+      "question": "帮我写一首关于春天的诗",
+      "expect": "no_hit",
+      "require_patterns": [
+        "未找到"
+      ],
+      "forbid_patterns": [
+        "(基于|根据|来自|出自)[^。！？]{0,20}已入库",
+        "出自知识库",
+        "来自知识库"
+      ],
+      "_why": "创作类请求同样不该被包装成「引用知识库内容」。"
+    },
+    {
+      "id": "no_hit_hr_policy",
+      "question": "公司年假有多少天",
+      "expect": "no_hit",
+      "require_patterns": [
+        "未找到"
+      ],
+      "forbid_patterns": [
+        "(基于|根据|来自|出自)[^。！？]{0,20}已入库",
+        "出自知识库",
+        "来自知识库"
+      ],
+      "_why": "知识库没有制度类文档，属于「像答案但不是知识库内容」的陷阱题，最容易诱发编造。"
+    },
+    {
+      "id": "hit_doc_formats",
+      "question": "支持哪些文档格式",
+      "expect": "rag",
+      "forbid_patterns": [
+        "知识库中未找到"
+      ],
+      "_why": "知识库里有明确答案（产品说明），必须命中并标注来源。"
+    },
+    {
+      "id": "hit_product_purpose",
+      "question": "这个产品是用来做什么的",
+      "expect": "rag",
+      "forbid_patterns": [
+        "知识库中未找到"
+      ],
+      "_why": "命中路径的正向对照：有资料时应当正常作答，而不是一律回答「未找到」。"
+    },
+    {
+      "id": "hit_chunk_strategy",
+      "question": "切片策略是什么",
+      "expect": "rag",
+      "forbid_patterns": [
+        "知识库中未找到"
+      ],
+      "_why": "专有名词题，验证检索命中后模型确实按资料作答。"
+    }
+  ]
+}
