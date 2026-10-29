@@ -126,6 +126,10 @@ const [uploadOpen, setUploadOpen] = useState(false);
     [activeId, loadMessages]
   );
 
+  // 是否存在对话内容：决定输入框是「首页居中」还是「底部停靠」
+  // （参考网页版 DeepSeek：空会话时输入框居中，一旦有消息就沉到底部）
+  const hasMessages = messages.length > 0;
+
   return (
     // 最外层：横向 flex，左侧栏 + 右侧对话区；浅灰背景
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'row', background: '#f7f8fa' }}>
@@ -164,7 +168,8 @@ const [uploadOpen, setUploadOpen] = useState(false);
           <div
             style={{
               width: '100%',
-              maxWidth: 880, // 居中窄栏，避免长文本过宽
+              // 加宽内容栏：输入框与消息区共用同一宽度，避免视觉上偏窄
+              maxWidth: 960,
               display: 'flex',
               flexDirection: 'column',
               background: '#f7f8fa',
@@ -172,7 +177,7 @@ const [uploadOpen, setUploadOpen] = useState(false);
           >
             {/* 错误提示：SSE 中断或后端异常时展示，可手动关闭（P1-F2） */}
             {error && (
-              <div style={{ padding: '0 20px 8px' }}>
+              <div style={{ padding: '0 24px 8px' }}>
                 <Alert
                   type="error"
                   showIcon
@@ -181,8 +186,71 @@ const [uploadOpen, setUploadOpen] = useState(false);
                 />
               </div>
             )}
-            <MessageList messages={messages} streamingId={streamingId} />
-            <ChatInput onSend={sendMessage} onStop={stop} status={status} />
+
+            {/* 两种布局状态（参考网页版 DeepSeek）：
+                - 无对话：欢迎语 + 输入框整体垂直居中，输入框作为首屏视觉主体；
+                - 有对话：消息区占满剩余高度，输入框停靠在底部。 */}
+            {hasMessages ? (
+              <>
+                <MessageList messages={messages} streamingId={streamingId} />
+                {/* 底部停靠：左右留白略大，让输入卡片与消息区对齐 */}
+                <div style={{ padding: '0 24px 16px' }}>
+                  <ChatInput
+                    onSend={sendMessage}
+                    onStop={stop}
+                    status={status}
+                    variant="dock"
+                  />
+                </div>
+              </>
+            ) : (
+              <div
+                style={{
+                  flex: 1,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'center', // 垂直居中
+                  alignItems: 'center',
+                  // 上移一点：视觉重心略高于几何中心，观感更稳
+                  padding: '0 24px 72px',
+                }}
+              >
+                {/* 欢迎语 */}
+                <div
+                  style={{
+                    width: '100%',
+                    maxWidth: 820,
+                    textAlign: 'center',
+                    marginBottom: 28,
+                  }}
+                >
+                  <h1
+                    style={{
+                      margin: '0 0 10px',
+                      fontSize: 28,
+                      fontWeight: 600,
+                      letterSpacing: 0.2,
+                      color: '#1f1f1f',
+                    }}
+                  >
+                    有什么可以帮你的？
+                  </h1>
+                  <p style={{ margin: 0, fontSize: 14, color: '#8b8f96' }}>
+                    基于知识库检索增强，回答会标注引用来源
+                  </p>
+                </div>
+
+                {/* 居中输入框：与底部形态共用组件，仅切换 variant */}
+                <div style={{ width: '100%', maxWidth: 820 }}>
+                  <ChatInput
+                    onSend={sendMessage}
+                    onStop={stop}
+                    status={status}
+                    variant="hero"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

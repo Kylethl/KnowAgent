@@ -45,19 +45,22 @@ export default function MessageBubble({
           flexDirection: 'column',
           // 用户消息靠右对齐，助手消息靠左对齐
           alignItems: isUser ? 'flex-end' : 'flex-start',
-          maxWidth: '70%', // 限制最大宽度，避免长文本撑满
+          maxWidth: '76%', // 限制最大宽度，避免长文本撑满（内容栏加宽后同步放宽）
         }}
       >
-        {/* 气泡本体：根据角色切换背景与文字颜色 */}
+        {/* 气泡本体：根据角色切换背景与文字颜色。
+            圆角：18px 大圆角，靠近头像的一侧收小（6px）形成「气泡尖角」，
+            比纯直角更柔和，也比四角等圆更接近现代对话产品。 */}
         <div
           style={{
-            padding: '10px 14px',
-            borderRadius: 12,
+            padding: '11px 16px',
+            borderRadius: isUser ? '18px 6px 18px 18px' : '6px 18px 18px 18px',
             background: isUser ? '#386BF3' : '#f2f3f5', // 用户主色 / 助手浅灰
             color: isUser ? '#fff' : '#1f1f1f',
             whiteSpace: 'pre-wrap', // 保留换行与空格
             wordBreak: 'break-word', // 长单词自动换行
-            lineHeight: 1.6,
+            lineHeight: 1.7,
+            fontSize: 15,
           }}
         >
           {/* 流式输出中：内容为空显示「思考中」（加载/停顿态），

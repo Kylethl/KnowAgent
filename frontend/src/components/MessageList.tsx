@@ -38,7 +38,8 @@ export default function MessageList({
 
   // 正常渲染：遍历消息列表逐个渲染气泡
   return (
-    <div style={{ flex: 1, overflowY: 'auto', padding: '16px 20px' }}>
+    // 顶部留白略大、底部收紧：与停靠的输入卡片形成呼吸感
+    <div style={{ flex: 1, overflowY: 'auto', padding: '24px 24px 8px' }}>
       {messages.map((m) => (
         <MessageBubble key={m.id} message={m} streaming={m.id === streamingId} />
       ))}
